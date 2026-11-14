@@ -1,0 +1,181 @@
+"""Offscreen GUI tests for the TempBox main window.
+
+These run with Qt's "offscreen" platform plugin so they do not open windows on
+the developer's desktop. Menu bar interaction itself is verified manually.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDropEvent
+from PySide6.QtWidgets import QApplication
+
+from tempbox.storage import FileStore
+from tempbox.window import MainWindow
+
+
+class MainWindowTest(unittest.TestCase):
+    app: QApplication
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="tempbox-window-test-")
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.data_dir = base / "data"
+        self.source_dir = base / "sources"
+        self.source_dir.mkdir()
+        self.store = FileStore(self.data_dir)
+        self.store.load()
+        self.window = MainWindow(self.store)
+
+    # -- helpers -------------------------------------------------------
+
+    def _make_source(self, name: str, content: bytes = b"window test content") -> Path:
+        path = self.source_dir / name
+        path.write_bytes(content)
+        return path
+
+    def _mime_for(self, *paths: Path) -> QMimeData:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path)) for path in paths])
+        return mime
+
+    def _drop(self, *paths: Path) -> QDropEvent:
+        mime = self._mime_for(*paths)  # keep alive while the event is processed
+        event = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        self.window.dropEvent(event)
+        return event
+
+    # -- empty state ---------------------------------------------------
+
+    def test_empty_state(self) -> None:
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertEqual(self.window.count_label.text(), "0 files")
+        self.assertIs(self.window.content.currentWidget(), self.window.empty_label)
+        self.assertFalse(self.window.open_button.isEnabled())
+        self.assertFalse(self.window.restore_button.isEnabled())
+
+    # -- drag and drop -------------------------------------------------
+
+    def test_drag_enter_accepts_file_urls_and_highlights(self) -> None:
+        source = self._make_source("drag.txt")
+        mime = self._mime_for(source)  # keep alive while the event is processed
+        event = QDragEnterEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.window.dragEnterEvent(event)
+
+        self.assertTrue(event.isAccepted())
+        self.assertTrue(self.window.drop_zone.property("dragging"))
+        self.window.dragLeaveEvent(QDragLeaveEvent())
+        self.assertFalse(self.window.drop_zone.property("dragging"))
+
+    def test_drag_enter_ignores_plain_text(self) -> None:
+        mime = QMimeData()
+        mime.setText("not a file")
+        event = QDragEnterEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.window.dragEnterEvent(event)
+
+        self.assertFalse(event.isAccepted())
+        self.assertFalse(self.window.drop_zone.property("dragging"))
+
+    def test_drop_single_file_updates_window(self) -> None:
+        source = self._make_source("notes.txt", b"hello")
+
+        event = self._drop(source)
+
+        self.assertTrue(event.isAccepted())
+        self.assertFalse(source.exists())
+        self.assertEqual(len(self.store.list_files()), 1)
+        self.assertEqual(self.window.table.rowCount(), 1)
+        self.assertEqual(self.window.table.item(0, 0).text(), "notes.txt")
+        self.assertEqual(self.window.count_label.text(), "1 file")
+        self.assertIs(self.window.content.currentWidget(), self.window.table)
+        self.assertIn("Imported 1 file", self.window.status_label.text())
+
+    def test_drop_multiple_files(self) -> None:
+        first = self._make_source("one.txt")
+        second = self._make_source("two.txt")
+
+        self._drop(first, second)
+
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual(self.window.count_label.text(), "2 files")
+        names = {self.window.table.item(row, 0).text() for row in range(2)}
+        self.assertEqual(names, {"one.txt", "two.txt"})
+        self.assertIn("Imported 2 files", self.window.status_label.text())
+
+    def test_drop_folder_reports_failure(self) -> None:
+        folder = self.source_dir / "a-folder"
+        folder.mkdir()
+
+        self._drop(folder)
+
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertIs(self.window.content.currentWidget(), self.window.empty_label)
+        status = self.window.status_label.text()
+        self.assertIn("Skipped", status)
+        self.assertIn("regular files", status)
+        self.assertTrue(folder.is_dir())
+
+    # -- selection and restore -----------------------------------------
+
+    def test_selection_enables_actions(self) -> None:
+        source = self._make_source("select.txt")
+        self._drop(source)
+
+        self.assertFalse(self.window.open_button.isEnabled())
+        self.window.table.selectRow(0)
+
+        self.assertTrue(self.window.open_button.isEnabled())
+        self.assertTrue(self.window.reveal_button.isEnabled())
+        self.assertTrue(self.window.restore_button.isEnabled())
+
+    def test_restore_updates_window_and_file(self) -> None:
+        source = self._make_source("restore.txt", b"restore me")
+        self._drop(source)
+        record = self.store.list_files()[0]
+        target = Path(record.original_path)
+
+        self.window._restore_to(record, target)
+
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"restore me")
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertEqual(self.window.count_label.text(), "0 files")
+        self.assertIs(self.window.content.currentWidget(), self.window.empty_label)
+        self.assertIn("Restored", self.window.status_label.text())
+        self.assertEqual(self.store.list_files(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,13 @@
+# Declarative record of the Phase 1 environment.
+# If `conda env create` stops with a CondaToSNonInteractiveError about the Anaconda
+# `defaults` channel, use the explicit `conda create --override-channels` commands
+# in README.md instead (they bypass the `defaults` channel).
+name: tempbox
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.14
+  - pip
+  - pip:
+      - PySide6==6.12.0

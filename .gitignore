@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# DSH memory plugin data
+.memsearch/
+
+# Packaging artifacts (used from Phase 4 on)
+build/
+dist/
+*.spec
