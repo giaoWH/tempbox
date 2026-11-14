@@ -1,7 +1,7 @@
-"""File management and JSON metadata storage for TempBox.
+"""File management, retention and JSON metadata storage for TempBox.
 
-This module intentionally has no Qt dependency so the file handling logic can be
-tested headlessly and reused outside the GUI.
+This module intentionally has no Qt dependency so file handling, retention
+calculation and expired-file clean-up can be tested headlessly.
 """
 
 from __future__ import annotations
@@ -11,14 +11,25 @@ import os
 import shutil
 import stat
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-SCHEMA_VERSION = 1
+from send2trash import send2trash
+
+SCHEMA_VERSION = 2
+SUPPORTED_INDEX_VERSIONS = (1, 2)
 RECORDS_FILENAME = "records.json"
 FILES_DIRNAME = "files"
+
+DEFAULT_RETENTION = timedelta(days=1)
+RETENTION_OPTIONS: tuple[tuple[str, timedelta], ...] = (
+    ("1 hour", timedelta(hours=1)),
+    ("1 day", timedelta(days=1)),
+    ("7 days", timedelta(days=7)),
+    ("30 days", timedelta(days=30)),
+)
 
 
 class StorageError(Exception):
@@ -35,6 +46,8 @@ class FileRecord:
     stored_relative_path: str
     size: int
     added_at: str
+    expires_at: str | None = None
+    trash_error: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +57,8 @@ class FileRecord:
             "stored_relative_path": self.stored_relative_path,
             "size": self.size,
             "added_at": self.added_at,
+            "expires_at": self.expires_at,
+            "trash_error": self.trash_error,
         }
 
     @classmethod
@@ -59,6 +74,18 @@ class FileRecord:
                 raise ValueError("original_path is not absolute")
             if stored_relative_path.is_absolute() or ".." in stored_relative_path.parts:
                 raise ValueError("stored_relative_path is not a safe relative path")
+
+            expires_at = None
+            if data.get("expires_at") is not None:
+                expires_at = str(data["expires_at"])
+                parsed_expiry = datetime.fromisoformat(expires_at)
+                if parsed_expiry.tzinfo is None:
+                    raise ValueError("expires_at has no time zone")
+
+            trash_error = None
+            if data.get("trash_error") is not None:
+                trash_error = str(data["trash_error"])
+
             return cls(
                 id=str(data["id"]),
                 original_name=str(data["original_name"]),
@@ -66,6 +93,8 @@ class FileRecord:
                 stored_relative_path=stored_relative_path.as_posix(),
                 size=int(data["size"]),
                 added_at=added_at,
+                expires_at=expires_at,
+                trash_error=trash_error,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"invalid file record: {exc}") from exc
@@ -77,6 +106,16 @@ class ImportResult:
 
     added: list[FileRecord] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class CleanupResult:
+    """Outcome of one expired-file clean-up pass."""
+
+    trashed: list[FileRecord] = field(default_factory=list)
+    failed: list[tuple[FileRecord, str]] = field(default_factory=list)
+    missing: list[FileRecord] = field(default_factory=list)
+    save_error: str | None = None
 
 
 class FileStore:
@@ -95,8 +134,10 @@ class FileStore:
     def load(self) -> list[str]:
         """(Re)load the index from disk.
 
-        Returns human readable problems (damaged index, missing files) without
-        deleting anything.
+        Phase 1 indexes (version 1) are accepted; their records simply have no
+        expiry time and are therefore never cleaned up automatically. Returns
+        human readable problems (damaged index, missing files) without deleting
+        anything.
         """
         self.records.clear()
         if not self.records_path.exists():
@@ -108,7 +149,7 @@ class FileStore:
             return [self._back_up_damaged_index(f"the index could not be read ({exc})")]
         if (
             not isinstance(data, dict)
-            or data.get("version") != SCHEMA_VERSION
+            or data.get("version") not in SUPPORTED_INDEX_VERSIONS
             or not isinstance(data.get("files"), list)
         ):
             return [self._back_up_damaged_index("the index structure is unexpected")]
@@ -189,6 +230,88 @@ class FileStore:
         _remove_empty_dir(stored.parent)
         return target
 
+    def set_expiry(self, record_id: str, expires_at: datetime) -> FileRecord:
+        """Set a new expiry time for a managed file and save the index."""
+        record = self.records.get(record_id)
+        if record is None:
+            raise StorageError("This file is no longer managed by TempBox.")
+        if expires_at.tzinfo is None:
+            raise StorageError("Expiry time must include a time zone.")
+        updated = replace(
+            record,
+            expires_at=expires_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            trash_error=None,
+        )
+        self.records[record_id] = updated
+        try:
+            self._save()
+        except OSError as exc:
+            self.records[record_id] = record
+            raise StorageError(f"Could not save the retention time: {exc}") from exc
+        return updated
+
+    def cleanup_expired(self, now: datetime | None = None) -> CleanupResult:
+        """Move expired files to the macOS Trash and update the index.
+
+        Only files that are recorded by TempBox, due by their own expiry time and
+        still present inside TempBox storage are touched. Files without an expiry
+        time (Phase 1 records) are never cleaned up automatically.
+        """
+        now = now or datetime.now(timezone.utc)
+        result = CleanupResult()
+        changed = False
+        for record in list(self.records.values()):
+            if record.expires_at is None:
+                continue
+            if datetime.fromisoformat(record.expires_at) > now:
+                continue
+            stored = self.stored_path(record)
+            if not _is_managed_path(stored, self.root):
+                message = "The stored file is outside the TempBox storage folder."
+                if self._mark_trash_error(record, message):
+                    changed = True
+                    result.failed.append((record, message))
+                continue
+            try:
+                stored_stat = stored.lstat()
+            except FileNotFoundError:
+                message = "The stored file is missing from TempBox storage."
+                if self._mark_trash_error(record, message):
+                    changed = True
+                    result.missing.append(record)
+                continue
+            except OSError as exc:
+                message = f"The stored file could not be read: {exc}"
+                if self._mark_trash_error(record, message):
+                    changed = True
+                    result.failed.append((record, message))
+                continue
+            if not stat.S_ISREG(stored_stat.st_mode):
+                message = "The stored item is not a regular file."
+                if self._mark_trash_error(record, message):
+                    changed = True
+                    result.failed.append((record, message))
+                continue
+            try:
+                send2trash(str(stored))
+            except Exception as exc:  # send2trash may raise OSError or platform errors
+                message = f"Could not move to Trash: {exc}"
+                if self._mark_trash_error(record, message):
+                    changed = True
+                    result.failed.append((record, message))
+                continue
+            del self.records[record.id]
+            _remove_empty_dir(stored.parent)
+            result.trashed.append(record)
+            changed = True
+
+        if changed:
+            try:
+                self._save()
+            except OSError as exc:
+                result.save_error = str(exc)
+        return result
+
     # -- internals -----------------------------------------------------
 
     def _import_one(self, source: Path) -> FileRecord:
@@ -219,13 +342,16 @@ class FileStore:
             _remove_empty_dir(destination.parent)
             raise StorageError(f"Could not move the file into TempBox: {exc}") from exc
 
+        added_at = datetime.now().astimezone()
+        expires_at = added_at.astimezone(timezone.utc) + DEFAULT_RETENTION
         record = FileRecord(
             id=record_id,
             original_name=source.name,
             original_path=str(source.absolute()),
             stored_relative_path=stored_relative_path.as_posix(),
             size=source_stat.st_size,
-            added_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            added_at=added_at.isoformat(timespec="seconds"),
+            expires_at=expires_at.isoformat(timespec="seconds"),
         )
         self.records[record.id] = record
         try:
@@ -242,6 +368,12 @@ class FileStore:
             _remove_empty_dir(destination.parent)
             raise StorageError(f"Could not save the TempBox index: {exc}") from exc
         return record
+
+    def _mark_trash_error(self, record: FileRecord, message: str) -> bool:
+        if record.trash_error == message:
+            return False
+        self.records[record.id] = replace(record, trash_error=message)
+        return True
 
     def _save(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -273,6 +405,16 @@ class FileStore:
             f"TempBox could not read its file index ({reason}). The previous index was "
             f"backed up to '{backup_path.name}' and TempBox started with an empty list."
         )
+
+
+def _is_managed_path(path: Path, root: Path) -> bool:
+    """True if path resolves to a location inside the TempBox data folder."""
+    try:
+        resolved_path = path.resolve()
+        resolved_root = root.resolve()
+    except OSError:
+        return False
+    return resolved_path.is_relative_to(resolved_root) and resolved_path != resolved_root
 
 
 def _is_same_device(source: Path, destination: Path) -> bool:

@@ -3,11 +3,12 @@
 **Temporary files deserve a temporary home.**
 
 TempBox is a small, native macOS menu bar app that gives temporary files a dedicated
-home. Drag files from Finder into TempBox; they are moved into TempBox's own folder
-and can be opened, revealed in Finder, or restored to their original location later.
+home. Drag files from Finder into TempBox; they are moved into TempBox's own folder,
+kept for a chosen period, and then automatically moved to the macOS Trash.
 
-> **Status: Phase 1 (v0.1).** Storing and restoring files works. Automatic expiry,
-> search, batch operations and packaging are planned for later phases.
+> **Status: Phase 2 (v0.2).** Retention times, live countdowns and automatic Trash
+> clean-up work. Search, batch actions, global settings, Finder integration and
+> packaging are planned for later phases.
 
 ## Requirements
 
@@ -16,12 +17,13 @@ and can be opened, revealed in Finder, or restored to their original location la
 
 ## Setup
 
-Verified on this machine: Python 3.14.10, PySide6 6.12.0 (Apple Silicon, macOS 27.0.1).
+Verified on this machine: Python 3.14.10, PySide6 6.12.0, Send2Trash 2.2.0
+(Apple Silicon, macOS 27.0.1).
 
 ```bash
 conda create -n tempbox -c conda-forge --override-channels python=3.14 pip
 conda activate tempbox
-pip install PySide6==6.12.0
+pip install PySide6==6.12.0 Send2Trash==2.2.0
 ```
 
 `environment.yml` records the same environment declaratively. On some newer Conda
@@ -43,30 +45,51 @@ The main window opens and a box icon appears in the macOS menu bar.
 
 - **Click the menu bar icon** to show or hide the main window. TempBox has no Dock
   icon; it lives only in the menu bar.
-- **Quit** with the window's **Quit** button (bottom right) or `Cmd+Q` while the
-  window is focused. On macOS 27, Qt reports status item clicks without the mouse
-  button information, so a right-click behaves like a normal click and the tray
-  menu may not open on that macOS version.
 - **Drag files from Finder** into the window (single or multiple files). Folders,
-  symbolic links and other special files are rejected with a status message.
-- Select a file and use **Open**, **Show in Finder** or **Restore**.
-  - Restore puts the file back at its original path.
-  - If the original folder is gone, or a file with the same name exists there,
-    TempBox asks you to choose another folder. Existing files are never overwritten.
+  symbolic links and other special files are rejected.
+- **New files are kept for 1 day by default.** Select a file and open the
+  **Retention** menu to choose 1 hour, 1 day, 7 days, 30 days, or a custom date and
+  time. Custom times must be in the future.
+- The **Remaining** column updates every 30 seconds. It turns amber when less than
+  one hour is left and red when the file is expired or its clean-up failed. Hover a
+  failed row to see the error.
+- **When a file expires it is moved to the macOS Trash**, so it can still be
+  recovered from the Trash. An overdue check also runs when the app starts.
+  Failed clean-ups are retried on the next 30-second check.
+- Files imported by Phase 1 show **No expiry** and are never cleaned up
+  automatically; use the Retention menu to give them a deadline.
+- Select a file and use **Open**, **Show in Finder** or **Restore**. Restore puts
+  the file back at its original path (or asks for another folder if needed) and
+  never overwrites existing files.
 - Closing the window hides it; TempBox keeps running in the menu bar.
+- **Quit** with the window's **Quit** button (bottom right) or `Cmd+Q` while the
+  window is focused. On macOS 27, Qt reports status item clicks without mouse button
+  information, so a right-click behaves like a normal click and the tray menu may
+  not open on that macOS version.
 
 ## Data location
 
 ```
 ~/Library/Application Support/TempBox/
 ├── files/<uuid>/<original-name>   # files managed by TempBox
-├── records.json                   # metadata index (atomic writes)
+├── records.json                   # metadata index (atomic writes, version 2)
 └── .instance.lock                 # single-instance lock
 ```
 
-TempBox only touches files the user drags in. Files are moved rather than copied,
-original names and paths are kept in `records.json`, and a damaged index is moved
-aside as `records.corrupt-*.json` instead of being deleted.
+`records.json` stores `expires_at` (UTC ISO 8601) and an optional `trash_error` for
+failed clean-ups. Phase 1 indexes (version 1) load unchanged: their records simply
+have no expiry and are never auto-cleaned; the index is upgraded to version 2 the
+next time it is saved.
+
+Safety rules for automatic clean-up:
+
+- only files recorded by TempBox, located inside TempBox storage, still being
+  regular files, and past their own expiry time are touched;
+- files are moved with `Send2Trash` (never permanently deleted);
+- missing files are reported and their records kept, never treated as cleaned;
+- failed clean-ups keep both the file and its record, with the error persisted;
+- a crash between the Trash move and the index write is detected on the next load
+  as a missing stored file and is not retried destructively.
 
 ## Tests
 
@@ -75,18 +98,22 @@ conda activate tempbox
 python -m unittest discover -s tests -t . -v
 ```
 
-Storage tests need no GUI. Window tests use Qt's `offscreen` platform so they do not
-open windows on the desktop. Menu bar clicks and real Finder drags are verified
-manually (see the Phase 1 acceptance notes).
+Storage tests mock `send2trash`; window tests use Qt's `offscreen` platform. The
+real macOS Trash behaviour was verified manually with throwaway files. Menu bar
+clicks and real Finder drags are verified manually (see the Phase 2 acceptance
+notes).
 
-## Known limitations (Phase 1)
+## Known limitations (Phase 2)
 
-- No automatic expiry or clean-up yet (Phase 2).
-- No search, sorting, batch operations or settings yet (Phase 3).
+- The default retention is fixed at 1 day; it is not configurable yet (Phase 3).
+- No search, sorting, batch operations or settings page yet (Phase 3).
+- Clean-up and file moves run on the GUI thread; fine for typical temporary files.
+- Failed clean-ups are retried every 30 seconds while the app is running; there is
+  no separate retry schedule or backoff.
+- The countdown has 30-second resolution.
 - English-only UI.
-- Files are moved on the GUI thread, so moving very large files briefly freezes the
-  window.
 - TempBox runs without a Dock icon (accessory activation policy).
 - On macOS 27 the Qt tray reports clicks as `Unknown`, so the right-click tray menu
   may not be available; quit from the window or with `Cmd+Q`.
-- The menu bar icon is a template image and follows the light/dark menu bar.
+- On this machine `Send2Trash` uses its ctypes backend (PyObjC is not installed);
+  it was verified to move files to the macOS Trash with their original names.

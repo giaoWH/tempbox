@@ -1,15 +1,17 @@
-"""Main window: drop area, file list and file actions."""
+"""Main window: drop area, file list, retention and file actions."""
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtCore import QDateTime, QMimeData, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
+    QColor,
     QDesktopServices,
     QDragEnterEvent,
     QDragLeaveEvent,
@@ -22,11 +24,15 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
@@ -36,13 +42,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .storage import FileRecord, FileStore, ImportResult, StorageError
+from .storage import (
+    CleanupResult,
+    DEFAULT_RETENTION,
+    FileRecord,
+    FileStore,
+    ImportResult,
+    RETENTION_OPTIONS,
+    StorageError,
+)
 
-COLUMNS = ("Name", "Size", "Added")
+COLUMNS = ("Name", "Size", "Added", "Expires", "Remaining")
+CLEANUP_INTERVAL_MS = 30_000
+EXPIRING_SOON = timedelta(hours=1)
+_AMBER = QColor("#d29922")
+_RED = QColor("#e5484d")
 
 
 class MainWindow(QWidget):
-    """TempBox main window: drag files in, see them, open or restore them."""
+    """TempBox main window: drag files in, manage their lifetime, act on them."""
 
     def __init__(self, store: FileStore) -> None:
         super().__init__()
@@ -50,12 +68,18 @@ class MainWindow(QWidget):
         self._build_ui()
         self._refresh()
 
+        self._cleanup_timer = QTimer(self)
+        self._cleanup_timer.setInterval(CLEANUP_INTERVAL_MS)
+        self._cleanup_timer.timeout.connect(self._run_cleanup)
+        self._cleanup_timer.start()
+        self._run_cleanup()
+
     # -- UI construction -----------------------------------------------
 
     def _build_ui(self) -> None:
         self.setWindowTitle("TempBox")
-        self.setMinimumSize(560, 440)
-        self.resize(640, 560)
+        self.setMinimumSize(620, 460)
+        self.resize(760, 560)
         self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
@@ -86,6 +110,9 @@ class MainWindow(QWidget):
         self.open_button = QPushButton("Open")
         self.reveal_button = QPushButton("Show in Finder")
         self.restore_button = QPushButton("Restore")
+        self.retention_button = QPushButton("Retention")
+        self.retention_menu = self._build_retention_menu()
+        self.retention_button.setMenu(self.retention_menu)
         self.open_button.clicked.connect(self._open_selected)
         self.reveal_button.clicked.connect(self._reveal_selected)
         self.restore_button.clicked.connect(self._restore_selected)
@@ -93,11 +120,12 @@ class MainWindow(QWidget):
         actions.addWidget(self.open_button)
         actions.addWidget(self.reveal_button)
         actions.addWidget(self.restore_button)
+        actions.addWidget(self.retention_button)
         actions.addStretch(1)
         layout.addLayout(actions)
 
         self.status_label = _muted_label(
-            "Drop files here. TempBox moves them into its own folder."
+            "Drop files here. New files are kept for 1 day; use Retention to change that."
         )
         self.status_label.setWordWrap(True)
         quit_button = QPushButton("Quit")
@@ -138,7 +166,7 @@ class MainWindow(QWidget):
         heading = QLabel("Drag files here")
         heading.setObjectName("dropTitle")
         hint = _muted_label(
-            "Files are moved into TempBox and can be restored to their original location."
+            "Files are moved into TempBox. They are moved to the Trash when their time is up."
         )
         heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -162,10 +190,22 @@ class MainWindow(QWidget):
         table.viewport().setAcceptDrops(False)
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for column in range(1, len(COLUMNS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setStretchLastSection(False)
         return table
+
+    def _build_retention_menu(self) -> QMenu:
+        menu = QMenu(self)
+        for label, duration in RETENTION_OPTIONS:
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, duration=duration: self._set_retention(duration)
+            )
+        menu.addSeparator()
+        custom_action = menu.addAction("Custom…")
+        custom_action.triggered.connect(self._set_custom_expiry)
+        return menu
 
     # -- list rendering ------------------------------------------------
 
@@ -173,6 +213,7 @@ class MainWindow(QWidget):
         selected = self._selected_record()
         selected_id = selected.id if selected else None
         records = self.store.list_files()
+        now = datetime.now(timezone.utc)
 
         self.table.setRowCount(len(records))
         for row, record in enumerate(records):
@@ -184,6 +225,15 @@ class MainWindow(QWidget):
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 1, size_item)
             self.table.setItem(row, 2, QTableWidgetItem(_format_added(record.added_at)))
+            self.table.setItem(row, 3, QTableWidgetItem(_format_expiry(record.expires_at)))
+
+            remaining_text, colour, tooltip = self._remaining_display(record, now)
+            remaining_item = QTableWidgetItem(remaining_text)
+            if colour is not None:
+                remaining_item.setForeground(colour)
+            if tooltip:
+                remaining_item.setToolTip(tooltip)
+            self.table.setItem(row, 4, remaining_item)
 
         count = len(records)
         self.count_label.setText(f"{count} {_plural(count, 'file', 'files')}")
@@ -195,6 +245,30 @@ class MainWindow(QWidget):
                     self.table.selectRow(row)
                     break
         self._update_buttons()
+
+    def _remaining_display(
+        self, record: FileRecord, now: datetime
+    ) -> tuple[str, QColor | None, str]:
+        if not self.store.stored_path(record).is_file():
+            return "File missing", _RED, "The stored file is missing from TempBox."
+        if record.trash_error:
+            return "Cleanup failed", _RED, record.trash_error
+        if record.expires_at is None:
+            return "No expiry", None, "This file has no expiry time. Use Retention to set one."
+        remaining = datetime.fromisoformat(record.expires_at) - now
+        if remaining <= timedelta(0):
+            return "Expired", _RED, "Expired and waiting to be moved to the Trash."
+        seconds = int(remaining.total_seconds())
+        if remaining < EXPIRING_SOON:
+            minutes = max(1, math.ceil(seconds / 60))
+            return f"{minutes} {_plural(minutes, 'minute', 'minutes')} left", _AMBER, ""
+        hours = math.ceil(seconds / 3600)
+        days = math.ceil(seconds / 86400)
+        if days > 1:
+            return f"{days} days left", None, ""
+        if hours >= 24:
+            return "1 day left", None, ""
+        return f"{hours} {_plural(hours, 'hour', 'hours')} left", None, ""
 
     def _selected_record(self) -> FileRecord | None:
         row = self.table.currentRow()
@@ -210,6 +284,70 @@ class MainWindow(QWidget):
         self.open_button.setEnabled(has_selection)
         self.reveal_button.setEnabled(has_selection)
         self.restore_button.setEnabled(has_selection)
+        self.retention_button.setEnabled(has_selection)
+
+    # -- retention -----------------------------------------------------
+
+    def _set_retention(self, duration: timedelta) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        self._apply_expiry(record, datetime.now(timezone.utc) + duration)
+
+    def _set_custom_expiry(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        current = datetime.fromisoformat(record.expires_at) if record.expires_at else None
+        dialog = ExpiryDialog(current, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        expires_at = dialog.selected_expiry()
+        if expires_at <= datetime.now(timezone.utc):
+            QMessageBox.warning(
+                self, "Invalid expiry time", "Choose a time that is still in the future."
+            )
+            return
+        self._apply_expiry(record, expires_at)
+
+    def _apply_expiry(self, record: FileRecord, expires_at: datetime) -> None:
+        try:
+            updated = self.store.set_expiry(record.id, expires_at)
+        except StorageError as exc:
+            self._refresh()
+            self._notify_error(str(exc))
+            return
+        self._refresh()
+        self._set_status(
+            f"'{record.original_name}' now expires {_format_expiry(updated.expires_at)}."
+        )
+
+    # -- expiry clean-up -----------------------------------------------
+
+    def _run_cleanup(self) -> None:
+        result = self.store.cleanup_expired()
+        self._refresh()
+        self._report_cleanup(result)
+
+    def _report_cleanup(self, result: CleanupResult) -> None:
+        parts: list[str] = []
+        if result.trashed:
+            count = len(result.trashed)
+            parts.append(f"Moved {count} expired {_plural(count, 'file', 'files')} to Trash.")
+        if result.failed:
+            count = len(result.failed)
+            parts.append(
+                f"{count} {_plural(count, 'file', 'files')} could not be moved to Trash."
+            )
+        if result.missing:
+            count = len(result.missing)
+            parts.append(
+                f"{count} {_plural(count, 'file', 'files')} missing from TempBox storage."
+            )
+        if result.save_error:
+            parts.append(f"Could not save the file index: {result.save_error}")
+        if parts:
+            self._set_status(" ".join(parts))
 
     # -- imports -------------------------------------------------------
 
@@ -371,6 +509,45 @@ class MainWindow(QWidget):
         self.hide()
 
 
+class ExpiryDialog(QDialog):
+    """Small dialog for choosing a custom expiry date and time."""
+
+    def __init__(self, current: datetime | None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Custom expiry time")
+        self.setMinimumWidth(320)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        layout.addWidget(QLabel("Move this file to the Trash at:"))
+
+        self.editor = QDateTimeEdit(self)
+        self.editor.setCalendarPopup(True)
+        self.editor.setDisplayFormat("yyyy-MM-dd HH:mm")
+        minimum = QDateTime.currentDateTime().addSecs(60)
+        self.editor.setMinimumDateTime(minimum)
+        if current is not None:
+            initial = QDateTime.fromSecsSinceEpoch(int(current.timestamp()))
+        else:
+            default = datetime.now(timezone.utc) + DEFAULT_RETENTION
+            initial = QDateTime.fromSecsSinceEpoch(int(default.timestamp()))
+        if initial < minimum:
+            initial = minimum
+        self.editor.setDateTime(initial)
+        layout.addWidget(self.editor)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_expiry(self) -> datetime:
+        return datetime.fromtimestamp(self.editor.dateTime().toSecsSinceEpoch(), timezone.utc)
+
+
 def _muted_label(text: str = "") -> QLabel:
     label = QLabel(text)
     label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
@@ -398,4 +575,14 @@ def _format_added(added_at: str) -> str:
         moment = datetime.fromisoformat(added_at)
     except ValueError:
         return added_at
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _format_expiry(expires_at: str | None) -> str:
+    if not expires_at:
+        return "—"
+    try:
+        moment = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return expires_at
     return moment.astimezone().strftime("%Y-%m-%d %H:%M")

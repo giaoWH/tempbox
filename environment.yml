@@ -1,4 +1,4 @@
-# Declarative record of the Phase 1 environment.
+# Declarative record of the TempBox environment (Phase 2).
 # If `conda env create` stops with a CondaToSNonInteractiveError about the Anaconda
 # `defaults` channel, use the explicit `conda create --override-channels` commands
 # in README.md instead (they bypass the `defaults` channel).
@@ -11,3 +11,4 @@ dependencies:
   - pip
   - pip:
       - PySide6==6.12.0
+      - Send2Trash==2.2.0
