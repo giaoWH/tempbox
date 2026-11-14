@@ -36,6 +36,34 @@ class AppSettingsTest(unittest.TestCase):
             AppSettings.load(self.root).default_retention, timedelta(days=1)
         )
 
+    def test_default_phase4_flags(self) -> None:
+        settings = AppSettings.load(self.root)
+        self.assertFalse(settings.pause_auto_cleanup)
+        self.assertTrue(settings.remind_before_expiry)
+
+    def test_phase4_flags_roundtrip(self) -> None:
+        AppSettings(
+            default_retention=timedelta(days=7),
+            pause_auto_cleanup=True,
+            remind_before_expiry=False,
+        ).save(self.root)
+
+        loaded = AppSettings.load(self.root)
+
+        self.assertEqual(loaded.default_retention, timedelta(days=7))
+        self.assertTrue(loaded.pause_auto_cleanup)
+        self.assertFalse(loaded.remind_before_expiry)
+
+    def test_old_settings_file_keeps_defaults_for_new_flags(self) -> None:
+        payload = {"version": 1, "default_retention_seconds": 3600}
+        (self.root / "settings.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = AppSettings.load(self.root)
+
+        self.assertEqual(loaded.default_retention, timedelta(hours=1))
+        self.assertFalse(loaded.pause_auto_cleanup)
+        self.assertTrue(loaded.remind_before_expiry)
+
     def test_unknown_duration_falls_back_to_default(self) -> None:
         payload = {"version": 1, "default_retention_seconds": 12345}
         (self.root / "settings.json").write_text(json.dumps(payload), encoding="utf-8")

@@ -6,11 +6,13 @@ calculation and expired-file clean-up can be tested headlessly.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import stat
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -125,10 +127,50 @@ class FileStore:
         self.root = Path(root)
         self.records: dict[str, FileRecord] = {}
         self.default_retention: timedelta = DEFAULT_RETENTION
+        self._index_stamp: tuple[int, int] | None = None
 
     @property
     def records_path(self) -> Path:
         return self.root / RECORDS_FILENAME
+
+    # -- cross-process access ------------------------------------------
+
+    @contextmanager
+    def _locked(self):
+        """Serialize index access between the app and external helpers.
+
+        The Finder Quick Action runs in a different process; both sides take this
+        advisory lock around read-modify-write cycles.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / ".data.lock"
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _current_index_stamp(self) -> tuple[int, int] | None:
+        try:
+            status = self.records_path.stat()
+        except OSError:
+            return None
+        return (status.st_mtime_ns, status.st_size)
+
+    def _reload_if_changed(self) -> bool:
+        """Reload the index if another process changed it on disk."""
+        if self._current_index_stamp() == self._index_stamp:
+            return False
+        self.load()
+        return True
+
+    def refresh_from_disk(self) -> bool:
+        """Public refresh used by the UI to pick up external imports."""
+        if self._current_index_stamp() == self._index_stamp:
+            return False
+        with self._locked():
+            return self._reload_if_changed()
 
     # -- index ---------------------------------------------------------
 
@@ -141,6 +183,11 @@ class FileStore:
         anything.
         """
         self.records.clear()
+        problems = self._read_index()
+        self._index_stamp = self._current_index_stamp()
+        return problems
+
+    def _read_index(self) -> list[str]:
         if not self.records_path.exists():
             return []
         try:
@@ -162,7 +209,6 @@ class FileStore:
             if record.id in self.records:
                 return [self._back_up_damaged_index(f"duplicate file id '{record.id}'")]
             self.records[record.id] = record
-
         problems = []
         for record in self.records.values():
             if not self.stored_path(record).is_file():
@@ -185,6 +231,11 @@ class FileStore:
     # -- file operations -----------------------------------------------
 
     def import_files(self, sources: Iterable[Path | str]) -> ImportResult:
+        with self._locked():
+            self._reload_if_changed()
+            return self._import_files_unlocked(sources)
+
+    def _import_files_unlocked(self, sources: Iterable[Path | str]) -> ImportResult:
         """Move the given files into TempBox and record them in the index."""
         result = ImportResult()
         for source in sources:
@@ -196,6 +247,11 @@ class FileStore:
         return result
 
     def restore(self, record_id: str, target: Path | str) -> Path:
+        with self._locked():
+            self._reload_if_changed()
+            return self._restore_unlocked(record_id, target)
+
+    def _restore_unlocked(self, record_id: str, target: Path | str) -> Path:
         """Move a stored file to target, then drop its index record.
 
         The record is only removed after the file was moved successfully, so a
@@ -232,6 +288,11 @@ class FileStore:
         return target
 
     def set_expiry(self, record_id: str, expires_at: datetime) -> FileRecord:
+        with self._locked():
+            self._reload_if_changed()
+            return self._set_expiry_unlocked(record_id, expires_at)
+
+    def _set_expiry_unlocked(self, record_id: str, expires_at: datetime) -> FileRecord:
         """Set a new expiry time for a managed file and save the index."""
         record = self.records.get(record_id)
         if record is None:
@@ -252,6 +313,11 @@ class FileStore:
         return updated
 
     def set_expiries(self, record_ids: Iterable[str], expires_at: datetime) -> int:
+        with self._locked():
+            self._reload_if_changed()
+            return self._set_expiries_unlocked(record_ids, expires_at)
+
+    def _set_expiries_unlocked(self, record_ids: Iterable[str], expires_at: datetime) -> int:
         """Set the same expiry time for several files with a single index write."""
         if expires_at.tzinfo is None:
             raise StorageError("Expiry time must include a time zone.")
@@ -276,6 +342,11 @@ class FileStore:
         return len(previous)
 
     def cleanup_expired(self, now: datetime | None = None) -> CleanupResult:
+        with self._locked():
+            self._reload_if_changed()
+            return self._cleanup_expired_unlocked(now)
+
+    def _cleanup_expired_unlocked(self, now: datetime | None = None) -> CleanupResult:
         """Move expired files to the macOS Trash and update the index.
 
         Only files that are recorded by TempBox, due by their own expiry time and
@@ -414,6 +485,7 @@ class FileStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.records_path)
+            self._index_stamp = self._current_index_stamp()
         except OSError:
             _unlink_quietly(temporary_path)
             raise

@@ -2,16 +2,33 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.conda/
 
 # macOS / editors
 .DS_Store
 .idea/
 .vscode/
+*.swp
 
-# DSH memory plugin data
+# DSH memory plugin data (local tool state)
 .memsearch/
 
-# Packaging artifacts (used from Phase 4 on)
+# Logs and temporary files
+*.log
+*.tmp
+
+# Packaging artifacts
 build/
 dist/
 *.spec

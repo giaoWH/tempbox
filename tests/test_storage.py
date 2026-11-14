@@ -321,7 +321,9 @@ class FileStoreTest(unittest.TestCase):
     # -- cross-device moves --------------------------------------------
 
     @mock.patch("tempbox.storage._is_same_device", return_value=False)
-    def test_import_across_devices_copies_then_removes_source(self, _same_device: mock.Mock) -> None:
+    def test_import_across_devices_copies_then_removes_source(
+        self, _same_device: mock.Mock
+    ) -> None:
         source = self._make_source("cross.bin", b"cross-volume")
 
         result = self.store.import_files([source])

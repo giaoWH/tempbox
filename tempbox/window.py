@@ -1,4 +1,8 @@
-"""Main window: drop area, file list, retention, search, settings and actions."""
+"""Floating panel window: file cards, search, retention and file actions.
+
+The visual layout is the approved floating-panel design; all data and actions are
+backed by the real FileStore, settings and lifecycle logic.
+"""
 
 from __future__ import annotations
 
@@ -10,415 +14,580 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QDateTime,
-    QFileInfo,
-    QItemSelectionModel,
+    QEvent,
     QMimeData,
+    QPoint,
     QSize,
     Qt,
     QTimer,
     QUrl,
+    Signal,
 )
 from PySide6.QtGui import (
-    QCloseEvent,
     QColor,
+    QCloseEvent,
     QDesktopServices,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
-    QIcon,
     QKeySequence,
     QPalette,
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QDateTimeEdit,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
-    QFileIconProvider,
-    QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from . import autostart
+from .dialogs import ExpiryDialog, HistoryDialog, SettingsDialog
+from .formatting import (
+    duration_label as _duration_label,
+    format_added as _format_added,
+    format_expiry as _format_expiry,
+    format_size,
+    plural as _plural,
+)
+from .history import CleanupHistory
 from .settings import AppSettings
 from .storage import (
     CleanupResult,
-    DEFAULT_RETENTION,
     FileRecord,
     FileStore,
     ImportResult,
     RETENTION_OPTIONS,
     StorageError,
 )
+from .ui_theme import (
+    DARK,
+    LIGHT,
+    Theme,
+    brand_pixmap,
+    build_styles,
+    menu_styles,
+    search_icon,
+    settings_icon,
+)
+from .ui_widgets import DropZone, EmptyState, FileRow, PanelSurface
 
-COLUMNS = ("Name", "Size", "Added", "Expires", "Remaining")
 SORT_OPTIONS = (
-    ("Added (newest first)", "added"),
-    ("Name (A\u2013Z)", "name"),
-    ("Size (largest first)", "size"),
-    ("Expires (soonest first)", "expires"),
+    ("added", "Added"),
+    ("name", "Name"),
+    ("size", "Size"),
+    ("expires", "Expires"),
 )
 CLEANUP_INTERVAL_MS = 30_000
+EXTERNAL_SYNC_INTERVAL_MS = 2_000
+REMINDER_WINDOW = timedelta(minutes=10)
 EXPIRING_SOON = timedelta(hours=1)
 AUTO_HIDE_REOPEN_GRACE = 0.5
-_AMBER = QColor("#c58a00")
-_RED = QColor("#e5484d")
 
 
 class MainWindow(QWidget):
-    """TempBox main window: drag files in, manage their lifetime, act on them."""
+    """A compact macOS menu bar floating panel backed by the real FileStore."""
+
+    quit_requested = Signal()
+
+    PANEL_WIDTH = 420
+    SHADOW_MARGIN = 14
+    MAX_VISIBLE_ROWS = 7
 
     def __init__(self, store: FileStore) -> None:
-        super().__init__()
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAcceptDrops(True)
+        self.setWindowTitle("TempBox")
+
         self.store = store
         self.settings = AppSettings.load(store.root)
         self.store.default_retention = self.settings.default_retention
-        self._icon_provider = QFileIconProvider()
+        self._theme = LIGHT
+        self._theme_applied = False
+        self._rows: list[FileRow] = []
+        self._selection_mode = False
+        self._checked_ids: set[str] = set()
+        self._sort_key = "added"
+        self._search_text = ""
+        self._status_text = "Ready"
         self._auto_hidden_at: float | None = None
+        self._auto_cleanup_paused = self.settings.pause_auto_cleanup
+        if self._auto_cleanup_paused:
+            self._status_text = "Automatic cleanup is paused."
+        self._notifier = None
+        self._reminded: dict[str, str] = {}
+        self._history = CleanupHistory(store.root)
+
         self._build_ui()
-        self._refresh()
+        self.refresh_theme(force=True)
+        self._render_rows()
 
         self._cleanup_timer = QTimer(self)
         self._cleanup_timer.setInterval(CLEANUP_INTERVAL_MS)
-        self._cleanup_timer.timeout.connect(self._run_cleanup)
+        self._cleanup_timer.timeout.connect(self._on_cleanup_tick)
         self._cleanup_timer.start()
-        self._run_cleanup()
+
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(EXTERNAL_SYNC_INTERVAL_MS)
+        self._sync_timer.timeout.connect(self._sync_external_changes)
+        self._sync_timer.start()
+
+        if not self._auto_cleanup_paused:
+            self._run_cleanup()
+        else:
+            self._render_rows()
 
         application = QApplication.instance()
         if application is not None:
             application.applicationStateChanged.connect(self._on_application_state_changed)
+        self._connect_style_hints()
 
     # -- UI construction -----------------------------------------------
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("TempBox")
-        self.setMinimumSize(640, 500)
-        self.resize(780, 600)
-        self.setAcceptDrops(True)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(
+            self.SHADOW_MARGIN, self.SHADOW_MARGIN, self.SHADOW_MARGIN, self.SHADOW_MARGIN
+        )
+        outer.setSpacing(0)
+        self.surface = PanelSurface(self._theme, self)
+        self.surface.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        outer.addWidget(self.surface)
+        self._shadow = QGraphicsDropShadowEffect(self.surface)
+        self._shadow.setBlurRadius(26)
+        self._shadow.setOffset(0, 8)
+        self._shadow.setColor(QColor(0, 0, 0, 70))
+        self.surface.setGraphicsEffect(self._shadow)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 14)
-        layout.setSpacing(12)
+        layout = QVBoxLayout(self.surface)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
 
-        title = QLabel("TempBox")
-        title.setObjectName("titleLabel")
-        self.count_label = _muted_label()
+        layout.addLayout(self._build_header())
+        self.drop_zone = DropZone(self._theme)
+        layout.addWidget(self.drop_zone)
+        layout.addLayout(self._build_search_row())
+
+        self.list_stack = QStackedWidget()
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setAcceptDrops(False)
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.scroll.viewport().setAcceptDrops(False)
+        self.rows_container = QWidget()
+        self.rows_container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.rows_layout = QVBoxLayout(self.rows_container)
+        self.rows_layout.setContentsMargins(0, 2, 0, 2)
+        self.rows_layout.setSpacing(0)
+        self.scroll.setWidget(self.rows_container)
+        self.empty_state = EmptyState(self._theme)
+        self.list_stack.addWidget(self.scroll)
+        self.list_stack.addWidget(self.empty_state)
+        layout.addWidget(self.list_stack)
+
+        self.footer_stack = QStackedWidget()
+        self.footer_stack.addWidget(self._build_footer())
+        self.footer_stack.addWidget(self._build_batch_footer())
+        self.footer_stack.setFixedHeight(30)
+        layout.addWidget(self.footer_stack)
+
+        self.setFixedWidth(self.PANEL_WIDTH + self.SHADOW_MARGIN * 2)
+
+        self._escape_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._escape_shortcut.activated.connect(self.hide)
+        self._close_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Close), self)
+        self._close_shortcut.activated.connect(self.hide)
+        self._quit_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Quit), self)
+        self._quit_shortcut.activated.connect(self.quit_requested)
+
+        self._update_default_retention_text()
+
+    def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
+        header.setSpacing(7)
+        self.brand_label = QLabel()
+        self.brand_label.setPixmap(brand_pixmap(26))
+        self.brand_label.setFixedSize(26, 26)
+        title = QLabel("TempBox")
+        title.setObjectName("PanelTitle")
+        self.stats_label = QLabel("0 files")
+        self.stats_label.setObjectName("StatsLabel")
+        self.select_button = QToolButton()
+        self.select_button.setObjectName("HeaderButton")
+        self.select_button.setText("Select")
+        self.select_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_button.clicked.connect(self._toggle_selection_mode)
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("IconButton")
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.clicked.connect(self._open_settings)
+        header.addWidget(self.brand_label)
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(self.count_label)
-        layout.addLayout(header)
+        header.addWidget(self.stats_label)
+        header.addSpacing(4)
+        header.addWidget(self.select_button)
+        header.addWidget(self.settings_button)
+        return header
 
-        self.drop_zone = self._build_drop_zone()
-        layout.addWidget(self.drop_zone)
-
+    def _build_search_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(6)
         self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("SearchField")
         self.search_edit.setPlaceholderText("Search files")
         self.search_edit.setClearButtonEnabled(True)
-        self.sort_combo = QComboBox()
-        for label, key in SORT_OPTIONS:
-            self.sort_combo.addItem(label, key)
-        search_row = QHBoxLayout()
-        search_row.setSpacing(8)
-        search_row.addWidget(self.search_edit, 1)
-        search_row.addWidget(self.sort_combo)
-        layout.addLayout(search_row)
-
-        self.table = self._build_table()
-        self.empty_label = QLabel()
-        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_label.setWordWrap(True)
-
-        self.content = QStackedWidget()
-        self.content.addWidget(self.table)
-        self.content.addWidget(self.empty_label)
-        layout.addWidget(self.content, 1)
-
-        self.open_button = QPushButton("Open")
-        self.reveal_button = QPushButton("Show in Finder")
-        self.restore_button = QPushButton("Restore")
-        self.retention_button = QPushButton("Expiration")
-        self.retention_menu = self._build_retention_menu()
-        self.retention_button.setMenu(self.retention_menu)
-        self.open_button.clicked.connect(self._open_selected)
-        self.reveal_button.clicked.connect(self._reveal_selected)
-        self.restore_button.clicked.connect(self._restore_selected)
-        actions = QHBoxLayout()
-        actions.addWidget(self.open_button)
-        actions.addWidget(self.reveal_button)
-        actions.addWidget(self.restore_button)
-        actions.addWidget(self.retention_button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-
-        self.status_label = _muted_label(
-            "Drop files here. New files are kept for "
-            f"{_duration_label(self.store.default_retention)}."
+        self.search_edit.setFixedHeight(30)
+        self.search_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        self.search_action = self.search_edit.addAction(
+            search_icon(self._theme), QLineEdit.ActionPosition.LeadingPosition
         )
-        self.status_label.setWordWrap(True)
-        self.settings_button = QPushButton("Settings\u2026")
-        self.settings_button.setFlat(True)
-        self.settings_button.clicked.connect(self._open_settings)
-        quit_button = QPushButton("Quit")
-        quit_button.setFlat(True)
-        quit_button.clicked.connect(QApplication.instance().quit)
-        footer = QHBoxLayout()
-        footer.addWidget(self.status_label, 1)
-        footer.addWidget(self.settings_button)
-        footer.addWidget(quit_button)
-        layout.addLayout(footer)
-
-        self.search_edit.textChanged.connect(self._refresh)
-        self.sort_combo.currentIndexChanged.connect(self._refresh)
-        self.table.itemSelectionChanged.connect(self._update_buttons)
-        self.table.doubleClicked.connect(self._open_selected)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._show_context_menu)
-        self._quit_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Quit), self)
-        self._quit_shortcut.activated.connect(QApplication.instance().quit)
-        self._update_buttons()
-        self.table.setFocus()
-
-        self.setStyleSheet(
-            """
-            QLabel#titleLabel { font-size: 20px; font-weight: 600; }
-            QFrame#dropZone { border: 1px dashed palette(mid); border-radius: 10px; }
-            QFrame#dropZone[dragging="true"] {
-                border: 2px solid palette(highlight);
-                background: rgba(10, 132, 255, 0.10);
-            }
-            QLabel#dropTitle { font-size: 14px; font-weight: 600; }
-            QHeaderView::section { background: transparent; border: none; padding: 4px 6px; }
-            QLineEdit { padding: 4px 6px; }
-            """
-        )
-
-    def _build_drop_zone(self) -> QFrame:
-        zone = QFrame()
-        zone.setObjectName("dropZone")
-        zone.setMinimumHeight(94)
-        zone.setProperty("dragging", False)
-        zone_layout = QVBoxLayout(zone)
-        zone_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zone_layout.setSpacing(4)
-        heading = QLabel("Drag files here")
-        heading.setObjectName("dropTitle")
-        hint = _muted_label(
-            "Files are moved into TempBox and sent to the Trash when their time is up."
-        )
-        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setWordWrap(True)
-        zone_layout.addWidget(heading)
-        zone_layout.addWidget(hint)
-        return zone
-
-    def _build_table(self) -> QTableWidget:
-        table = QTableWidget(0, len(COLUMNS))
-        table.setHorizontalHeaderLabels(COLUMNS)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(32)
-        table.setShowGrid(False)
-        table.setAlternatingRowColors(False)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
-        table.setAcceptDrops(False)
-        table.viewport().setAcceptDrops(False)
-        table.setIconSize(QSize(16, 16))
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, len(COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(False)
-        return table
-
-    def _build_retention_menu(self) -> QMenu:
-        menu = QMenu(self)
-        for label, duration in RETENTION_OPTIONS:
-            action = menu.addAction(label)
+        self.sort_button = QToolButton()
+        self.sort_button.setObjectName("SortButton")
+        self.sort_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sort_button.setFixedHeight(30)
+        self.sort_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.sort_menu = QMenu(self)
+        for index, (key, label) in enumerate(SORT_OPTIONS):
+            action = self.sort_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(index == 0)
             action.triggered.connect(
-                lambda _checked=False, duration=duration: self._set_retention(duration)
+                lambda _checked=False, sort_key=key: self._set_sort(sort_key)
             )
-        menu.addSeparator()
-        custom_action = menu.addAction("Custom\u2026")
-        custom_action.triggered.connect(self._set_custom_expiry)
-        return menu
+        self.sort_button.setMenu(self.sort_menu)
+        self.sort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.sort_button.setText("Added")
+        row.addWidget(self.search_edit, 1)
+        row.addWidget(self.sort_button)
+        return row
+
+    def _build_footer(self) -> QWidget:
+        footer = QWidget()
+        layout = QHBoxLayout(footer)
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(4)
+        self.footer_status = QLabel(self._status_text)
+        self.footer_status.setObjectName("FooterText")
+        self.footer_hint = QLabel()
+        self.footer_hint.setObjectName("FooterHint")
+        self.pause_label = QLabel("Cleanup paused")
+        self.pause_label.setObjectName("PausedLabel")
+        self.pause_label.setToolTip("Automatic expiry cleanup is paused in Settings.")
+        self.pause_label.hide()
+        self.history_button = QPushButton("History")
+        self.history_button.setObjectName("FooterButton")
+        self.history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.history_button.clicked.connect(self._open_history)
+        self.quit_button = QPushButton("Quit")
+        self.quit_button.setObjectName("FooterButton")
+        self.quit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quit_button.clicked.connect(self.quit_requested)
+        layout.addWidget(self.footer_status)
+        layout.addStretch(1)
+        layout.addWidget(self.pause_label)
+        layout.addWidget(self.footer_hint)
+        layout.addWidget(self.history_button)
+        layout.addWidget(self.quit_button)
+        return footer
+
+    def _build_batch_footer(self) -> QWidget:
+        footer = QWidget()
+        layout = QHBoxLayout(footer)
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(2)
+        self.batch_count = QLabel("Select files")
+        self.batch_count.setObjectName("BatchCount")
+        self.restore_button = QPushButton("Restore")
+        self.restore_button.setObjectName("BatchButton")
+        self.restore_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.restore_button.clicked.connect(self._restore_checked)
+        self.expiration_button = QPushButton("Expiration")
+        self.expiration_button.setObjectName("BatchButton")
+        self.expiration_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.expiration_button.clicked.connect(self._show_batch_expiry_menu)
+        layout.addWidget(self.batch_count)
+        layout.addStretch(1)
+        layout.addWidget(self.restore_button)
+        layout.addWidget(self.expiration_button)
+        return footer
+
+    # -- theme ---------------------------------------------------------
+
+    def _connect_style_hints(self) -> None:
+        hints = QApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):
+            hints.colorSchemeChanged.connect(self._on_system_color_scheme_changed)
+
+    def _system_theme(self) -> Theme:
+        try:
+            dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+        except (AttributeError, RuntimeError):
+            dark = QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        return DARK if dark else LIGHT
+
+    def refresh_theme(self, force: bool = False) -> None:
+        theme = self._system_theme()
+        if not force and self._theme_applied and theme == self._theme:
+            return
+        self._theme = theme
+        self._theme_applied = True
+        self.setStyleSheet(build_styles(theme))
+        self.surface.set_theme(theme)
+        self.drop_zone.set_theme(theme)
+        self.empty_state.set_theme(theme)
+        self._shadow.setColor(QColor(0, 0, 0, 120) if theme.is_dark else QColor(0, 0, 0, 55))
+        self.search_action.setIcon(search_icon(theme))
+        self.settings_button.setIcon(settings_icon(theme))
+        for row in self._rows:
+            row.set_theme(theme)
+
+    def _on_system_color_scheme_changed(self, *args) -> None:
+        QTimer.singleShot(0, self.refresh_theme)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() in (
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.PaletteChange,
+        ):
+            QTimer.singleShot(0, self.refresh_theme)
+        super().changeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.search_edit.clearFocus()
+        self.surface.setFocus()
 
     # -- list rendering ------------------------------------------------
 
-    def _refresh(self) -> None:
-        selected_ids = {record.id for record in self._selected_records()}
-        all_records = self.store.list_files()
-        records = self._visible_records(all_records)
-        now = datetime.now(timezone.utc)
+    @property
+    def rows(self) -> list[FileRow]:
+        return self._rows
 
-        self.table.setRowCount(len(records))
-        for row, record in enumerate(records):
-            name_item = QTableWidgetItem(self._icon_for(record), record.original_name)
-            name_item.setData(Qt.ItemDataRole.UserRole, record.id)
-            name_item.setToolTip(record.original_path)
-            self.table.setItem(row, 0, name_item)
-            size_item = QTableWidgetItem(_format_size(record.size))
-            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(row, 1, size_item)
-            self.table.setItem(row, 2, QTableWidgetItem(_format_added(record.added_at)))
-            self.table.setItem(row, 3, QTableWidgetItem(_format_expiry(record.expires_at)))
+    @property
+    def auto_cleanup_paused(self) -> bool:
+        return self._auto_cleanup_paused
 
-            remaining_text, colour, tooltip = self._remaining_display(record, now)
-            remaining_item = QTableWidgetItem(remaining_text)
-            if colour is not None:
-                remaining_item.setForeground(colour)
-            if tooltip:
-                remaining_item.setToolTip(tooltip)
-            self.table.setItem(row, 4, remaining_item)
-
-        self.count_label.setText(_stats_text(len(all_records), sum(r.size for r in all_records)))
-        searching = bool(self.search_edit.text().strip())
-        self.empty_label.setText(_empty_text(bool(all_records), searching))
-        self.content.setCurrentWidget(self.table if records else self.empty_label)
-
-        selection = self.table.selectionModel()
-        selection.clearSelection()
-        for row, record in enumerate(records):
-            if record.id in selected_ids:
-                index = self.table.model().index(row, 0)
-                selection.select(
-                    index,
-                    QItemSelectionModel.SelectionFlag.Select
-                    | QItemSelectionModel.SelectionFlag.Rows,
-                )
-        self._update_buttons()
-
-    def _visible_records(self, records: list[FileRecord]) -> list[FileRecord]:
-        keyword = self.search_edit.text().strip().lower()
+    def _visible_records(self) -> list[FileRecord]:
+        records = self.store.list_files()
+        keyword = self._search_text.strip().casefold()
         if keyword:
-            records = [record for record in records if keyword in record.original_name.lower()]
-        sort_key = self.sort_combo.currentData()
-        if sort_key == "name":
-            records.sort(key=lambda record: record.original_name.lower())
-        elif sort_key == "size":
+            records = [
+                record for record in records if keyword in record.original_name.casefold()
+            ]
+        if self._sort_key == "name":
+            records.sort(key=lambda record: record.original_name.casefold())
+        elif self._sort_key == "size":
             records.sort(key=lambda record: record.size, reverse=True)
-        elif sort_key == "expires":
+        elif self._sort_key == "expires":
             records.sort(key=_expiry_sort_key)
         return records
 
-    def _icon_for(self, record: FileRecord) -> QIcon:
+    def _row_display(self, record: FileRecord, now: datetime) -> tuple[str, str, str]:
         stored = self.store.stored_path(record)
-        target = stored if stored.exists() else Path(record.original_name)
-        return self._icon_provider.icon(QFileInfo(str(target)))
-
-    def _remaining_display(
-        self, record: FileRecord, now: datetime
-    ) -> tuple[str, QColor | None, str]:
-        if not self.store.stored_path(record).is_file():
-            return "File missing", _RED, "The stored file is missing from TempBox."
+        added = _format_added(record.added_at)
+        expires = _format_expiry(record.expires_at)
+        tooltip = (
+            f"{record.original_name}\n{format_size(record.size)}\n"
+            f"Added {added}\nExpires {expires}"
+        )
+        if not stored.is_file():
+            return "File missing", "failed", tooltip + "\nThe stored file is missing."
         if record.trash_error:
-            return "Cleanup failed", _RED, record.trash_error
+            return "Cleanup failed", "failed", tooltip + f"\n{record.trash_error}"
         if record.expires_at is None:
-            return "No expiry", None, "This file has no expiry time. Use Expiration to set one."
+            return "No expiration", "none", tooltip
         remaining = datetime.fromisoformat(record.expires_at) - now
         if remaining <= timedelta(0):
-            return "Expired", _RED, "Expired and waiting to be moved to the Trash."
+            return "Expired", "expired", tooltip
         seconds = int(remaining.total_seconds())
         if remaining < EXPIRING_SOON:
             minutes = max(1, math.ceil(seconds / 60))
-            return f"{minutes} {_plural(minutes, 'minute', 'minutes')} left", _AMBER, ""
+            return f"{minutes} min", "soon", tooltip
         hours = math.ceil(seconds / 3600)
         days = math.ceil(seconds / 86400)
         if days > 1:
-            return f"{days} days left", None, ""
+            return f"{days} days", "normal", tooltip
         if hours >= 24:
-            return "1 day left", None, ""
-        return f"{hours} {_plural(hours, 'hour', 'hours')} left", None, ""
+            return "1 day", "normal", tooltip
+        return f"{hours} {_plural(hours, 'hour', 'hours')}", "normal", tooltip
 
-    def _selected_records(self) -> list[FileRecord]:
-        model = self.table.selectionModel()
-        records: list[FileRecord] = []
-        for index in sorted(model.selectedRows(), key=lambda item: item.row()):
-            item = self.table.item(index.row(), 0)
-            if item is None:
-                continue
-            record = self.store.get(str(item.data(Qt.ItemDataRole.UserRole)))
-            if record is not None:
-                records.append(record)
-        return records
+    def _render_rows(self) -> None:
+        existing_ids = {record.id for record in self.store.records.values()}
+        self._checked_ids &= existing_ids
+        while self.rows_layout.count():
+            item = self.rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._rows = []
 
-    def _single_selected_record(self) -> FileRecord | None:
-        records = self._selected_records()
-        return records[0] if len(records) == 1 else None
+        visible = self._visible_records()
+        now = datetime.now(timezone.utc)
+        for record in visible:
+            remaining, tone, tooltip = self._row_display(record, now)
+            row = FileRow(record, remaining, tone, tooltip, self._theme)
+            row.set_selection_mode(self._selection_mode)
+            row.set_checked(record.id in self._checked_ids)
+            row.menu_requested.connect(self._show_row_menu)
+            row.checked_changed.connect(self._on_row_checked)
+            row.opened.connect(self._open_row)
+            self.rows_layout.addWidget(row)
+            self._rows.append(row)
+        self.rows_layout.addStretch(1)
 
-    def _update_buttons(self) -> None:
-        selected = self._selected_records()
-        single = len(selected) == 1
-        self.open_button.setEnabled(single)
-        self.reveal_button.setEnabled(single)
-        self.restore_button.setEnabled(bool(selected))
-        self.retention_button.setEnabled(bool(selected))
+        all_records = self.store.list_files()
+        total_size = sum(record.size for record in all_records)
+        self.stats_label.setText(_stats_text(len(all_records), total_size))
 
-    def _on_application_state_changed(self, state: Qt.ApplicationState) -> None:
-        if state == Qt.ApplicationState.ApplicationActive:
-            return
+        has_rows = bool(visible)
+        if has_rows:
+            self.list_stack.setCurrentWidget(self.scroll)
+        else:
+            self.list_stack.setCurrentWidget(self.empty_state)
+            if all_records and self._search_text.strip():
+                self.empty_state.set_state(
+                    "No files match your search.", "Try a different keyword."
+                )
+            else:
+                self.empty_state.set_state(
+                    "No files yet", "Drop files here and we'll take care of the rest."
+                )
+        self.list_stack.setFixedHeight(
+            (min(max(len(visible), 1), self.MAX_VISIBLE_ROWS) * FileRow.ROW_HEIGHT + 8)
+            if has_rows
+            else 148
+        )
+        self._update_batch_footer()
+        self._relayout()
+
+    def _refresh(self) -> None:
+        self._render_rows()
+
+    def _relayout(self) -> None:
+        self.surface.layout().activate()
+        self.surface.adjustSize()
+        self.layout().activate()
+        self.adjustSize()
+        self._clamp_to_screen()
+
+    def _clamp_to_screen(self) -> None:
         if not self.isVisible():
             return
-        if (
-            QApplication.activeModalWidget() is not None
-            or QApplication.activePopupWidget() is not None
-        ):
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
             return
-        self.hide()
-        self._auto_hidden_at = time.monotonic()
+        available = screen.availableGeometry()
+        margin = self.SHADOW_MARGIN
+        width = self.width() - margin * 2
+        height = self.height() - margin * 2
+        x = max(
+            available.left() + 8 - margin,
+            min(self.x(), available.right() - 8 - margin - width),
+        )
+        y = max(
+            available.top() + 8 - margin,
+            min(self.y(), available.bottom() - 8 - margin - height),
+        )
+        self.move(x, y)
 
-    def consume_recent_auto_hide(self) -> bool:
-        """True if the window was hidden by the click-outside logic just now.
+    # -- stats ---------------------------------------------------------
 
-        Clicking the menu bar icon can deactivate the app a moment before the
-        tray activation is delivered; without this check the toggle would think
-        the window was already hidden and show it again.
-        """
-        if self._auto_hidden_at is None:
-            return False
-        hidden_seconds_ago = time.monotonic() - self._auto_hidden_at
-        self._auto_hidden_at = None
-        return hidden_seconds_ago <= AUTO_HIDE_REOPEN_GRACE
+    def content_size(self) -> QSize:
+        return QSize(self.PANEL_WIDTH, self.surface.height())
 
-    def clear_auto_hide_marker(self) -> None:
-        self._auto_hidden_at = None
+    # -- search / sort -------------------------------------------------
+
+    def _on_search_changed(self, text: str) -> None:
+        self._search_text = text
+        self._render_rows()
+
+    def _set_sort(self, key: str) -> None:
+        self._sort_key = key
+        label = self._sort_label()
+        for action in self.sort_menu.actions():
+            action.setChecked(action.text() == label)
+        self.sort_button.setText(label)
+        self._render_rows()
+
+    def _sort_label(self) -> str:
+        for key, label in SORT_OPTIONS:
+            if key == self._sort_key:
+                return label
+        return "Added"
+
+    # -- selection -----------------------------------------------------
+
+    def _toggle_selection_mode(self) -> None:
+        self.set_selection_mode(not self._selection_mode)
+
+    def set_selection_mode(self, enabled: bool) -> None:
+        self._selection_mode = enabled
+        self.select_button.setText("Done" if enabled else "Select")
+        if not enabled:
+            self._checked_ids.clear()
+        for row in self._rows:
+            row.set_selection_mode(enabled)
+            row.set_checked(row.record.id in self._checked_ids)
+        self.footer_stack.setCurrentIndex(1 if enabled else 0)
+        self._update_batch_footer()
+
+    def _on_row_checked(self, row: FileRow, checked: bool) -> None:
+        if checked:
+            self._checked_ids.add(row.record.id)
+        else:
+            self._checked_ids.discard(row.record.id)
+        row.set_checked(checked)
+        self._update_batch_footer()
+
+    def _checked_records(self) -> list[FileRecord]:
+        records: list[FileRecord] = []
+        for row in self._rows:
+            if row.record.id in self._checked_ids:
+                records.append(row.record)
+        return records
+
+    def _update_batch_footer(self) -> None:
+        count = len(self._checked_ids)
+        self.batch_count.setText("Select files" if count == 0 else f"{count} selected")
+        self.restore_button.setEnabled(count > 0)
+        self.expiration_button.setEnabled(count > 0)
 
     # -- retention -----------------------------------------------------
 
-    def _set_retention(self, duration: timedelta) -> None:
-        records = self._selected_records()
-        if not records:
+    def _set_retention(
+        self, duration: timedelta, records: list[FileRecord] | None = None
+    ) -> None:
+        targets = records if records is not None else self._checked_records()
+        if not targets:
             return
-        self._apply_expiry(records, datetime.now(timezone.utc) + duration)
+        self._apply_expiry(targets, datetime.now(timezone.utc) + duration)
 
-    def _set_custom_expiry(self) -> None:
-        records = self._selected_records()
-        if not records:
+    def _set_custom_expiry(self, records: list[FileRecord] | None = None) -> None:
+        targets = records if records is not None else self._checked_records()
+        if not targets:
             return
         current = None
-        if len(records) == 1 and records[0].expires_at:
-            current = datetime.fromisoformat(records[0].expires_at)
+        if len(targets) == 1 and targets[0].expires_at:
+            current = datetime.fromisoformat(targets[0].expires_at)
         dialog = ExpiryDialog(current, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -428,7 +597,7 @@ class MainWindow(QWidget):
                 self, "Invalid expiry time", "Choose a time that is still in the future."
             )
             return
-        self._apply_expiry(records, expires_at)
+        self._apply_expiry(targets, expires_at)
 
     def _apply_expiry(self, records: list[FileRecord], expires_at: datetime) -> None:
         try:
@@ -442,10 +611,10 @@ class MainWindow(QWidget):
                 count = self.store.set_expiries([record.id for record in records], expires_at)
                 message = f"Updated the expiry time for {count} files."
         except StorageError as exc:
-            self._refresh()
+            self._render_rows()
             self._notify_error(str(exc))
             return
-        self._refresh()
+        self._render_rows()
         self._set_status(message)
 
     # -- settings ------------------------------------------------------
@@ -462,16 +631,171 @@ class MainWindow(QWidget):
         except OSError as exc:
             self._notify_error(f"Could not save settings: {exc}")
             return
+        self._update_default_retention_text()
         self._set_status(f"New files will be kept for {_duration_label(duration)}.")
+
+    def _update_default_retention_text(self) -> None:
+        label = _duration_label(self.store.default_retention)
+        self.footer_hint.setText(f"Default \u00b7 {label}")
+        self.drop_zone.set_hint(f"Keep for {label} by default")
+        self._update_pause_indicator()
+
+    def _update_pause_indicator(self) -> None:
+        self.pause_label.setVisible(self._auto_cleanup_paused)
+        # The footer is compact; while paused the amber status replaces the
+        # default-retention hint instead of squeezing both into one row.
+        self.footer_hint.setVisible(not self._auto_cleanup_paused)
+
+    def _save_settings(self) -> bool:
+        try:
+            self.settings.save(self.store.root)
+        except OSError as exc:
+            self._notify_error(f"Could not save settings: {exc}")
+            return False
+        return True
+
+    def set_auto_cleanup_paused(self, paused: bool) -> bool:
+        """Persistently pause/resume cleanup, confirming overdue files on resume."""
+        if paused == self._auto_cleanup_paused:
+            return True
+        overdue: list[FileRecord] = []
+        if not paused:
+            overdue = self._overdue_records()
+            if overdue:
+                count = len(overdue)
+                answer = QMessageBox.question(
+                    self,
+                    "Resume automatic cleanup",
+                    f"{count} {_plural(count, 'file is', 'files are')} past the expiry time.\n\n"
+                    "Move them to the Trash now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._set_status("Automatic cleanup remains paused.")
+                    return False
+        previous = self._auto_cleanup_paused
+        self.settings.pause_auto_cleanup = paused
+        if not self._save_settings():
+            self.settings.pause_auto_cleanup = previous
+            return False
+        self._auto_cleanup_paused = paused
+        self._update_pause_indicator()
+        if paused:
+            self._set_status("Automatic cleanup paused.")
+        else:
+            self._set_status("Automatic cleanup resumed.")
+            self._run_cleanup()
+        return True
+
+    def _overdue_records(self) -> list[FileRecord]:
+        now = datetime.now(timezone.utc)
+        overdue = []
+        for record in self.store.list_files():
+            if not record.expires_at:
+                continue
+            try:
+                expires_at = datetime.fromisoformat(record.expires_at)
+            except ValueError:
+                continue
+            if expires_at <= now:
+                overdue.append(record)
+        return overdue
+
+    # -- notifications / external changes ------------------------------
+
+    def set_notifier(self, notifier) -> None:
+        self._notifier = notifier
+
+    def _sync_external_changes(self) -> None:
+        if (
+            QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+        ):
+            return
+        try:
+            changed = self.store.refresh_from_disk()
+        except StorageError:
+            return
+        if changed:
+            self._render_rows()
+
+    def check_expiry_reminders(self) -> None:
+        """Notify once per file/expiry pair within 10 minutes of expiry."""
+        if not self.settings.remind_before_expiry:
+            return
+        records = self.store.list_files()
+        known = {record.id: record.expires_at for record in records if record.expires_at}
+        self._reminded = {
+            record_id: expires_at
+            for record_id, expires_at in self._reminded.items()
+            if known.get(record_id) == expires_at
+        }
+        now = datetime.now(timezone.utc)
+        due: list[FileRecord] = []
+        for record in records:
+            if not record.expires_at:
+                continue
+            try:
+                expires_at = datetime.fromisoformat(record.expires_at)
+            except ValueError:
+                continue
+            remaining = expires_at - now
+            if timedelta(0) < remaining <= REMINDER_WINDOW:
+                if self._reminded.get(record.id) != record.expires_at:
+                    due.append(record)
+        if not due:
+            return
+        for record in due:
+            self._reminded[record.id] = record.expires_at
+        if self._notifier is None:
+            return
+        if len(due) == 1:
+            remaining = datetime.fromisoformat(due[0].expires_at) - now
+            minutes = max(1, math.ceil(remaining.total_seconds() / 60))
+            message = f"'{due[0].original_name}' will expire in {minutes} minutes."
+        else:
+            names = ", ".join(f"'{record.original_name}'" for record in due[:3])
+            if len(due) > 3:
+                names += ", ..."
+            message = f"{len(due)} files will expire in the next 10 minutes: {names}"
+        try:
+            self._notifier("TempBox", message)
+        except Exception:
+            # Notification failures must never affect cleanup or file handling.
+            pass
+
+    def _on_cleanup_tick(self) -> None:
+        self._sync_external_changes()
+        self.check_expiry_reminders()
+        if self._auto_cleanup_paused:
+            self._render_rows()
+            return
+        self._run_cleanup()
+
+    # -- history -------------------------------------------------------
+
+    def _open_history(self) -> None:
+        dialog = HistoryDialog(self)
+        dialog.exec()
 
     # -- expiry clean-up -----------------------------------------------
 
     def _run_cleanup(self) -> None:
         result = self.store.cleanup_expired()
-        self._refresh()
-        self._report_cleanup(result)
+        history_error: str | None = None
+        if result.trashed:
+            try:
+                self._history.load()
+                self._history.add(result.trashed)
+            except OSError as exc:
+                history_error = str(exc)
+        self._render_rows()
+        self._report_cleanup(result, history_error)
 
-    def _report_cleanup(self, result: CleanupResult) -> None:
+    def _report_cleanup(
+        self, result: CleanupResult, history_error: str | None = None
+    ) -> None:
         parts: list[str] = []
         if result.trashed:
             count = len(result.trashed)
@@ -488,6 +812,8 @@ class MainWindow(QWidget):
             )
         if result.save_error:
             parts.append(f"Could not save the file index: {result.save_error}")
+        if history_error:
+            parts.append(f"Could not save cleanup history: {history_error}")
         if parts:
             self._set_status(" ".join(parts))
 
@@ -497,7 +823,7 @@ class MainWindow(QWidget):
         if not paths:
             return
         result = self.store.import_files(paths)
-        self._refresh()
+        self._render_rows()
         self._show_import_result(result)
 
     def _show_import_result(self, result: ImportResult) -> None:
@@ -513,7 +839,7 @@ class MainWindow(QWidget):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._local_paths(event.mimeData()):
-            self._set_dragging(True)
+            self.drop_zone.set_active(True)
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -525,11 +851,11 @@ class MainWindow(QWidget):
             event.ignore()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
-        self._set_dragging(False)
+        self.drop_zone.set_active(False)
         event.accept()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        self._set_dragging(False)
+        self.drop_zone.set_active(False)
         paths = self._local_paths(event.mimeData())
         if not paths:
             event.ignore()
@@ -547,20 +873,37 @@ class MainWindow(QWidget):
             if url.isLocalFile() and url.toLocalFile()
         ]
 
-    def _set_dragging(self, dragging: bool) -> None:
-        if self.drop_zone.property("dragging") == dragging:
-            return
-        self.drop_zone.setProperty("dragging", dragging)
-        style = self.drop_zone.style()
-        style.unpolish(self.drop_zone)
-        style.polish(self.drop_zone)
-
     # -- file actions --------------------------------------------------
 
-    def _open_selected(self) -> None:
-        record = self._single_selected_record()
-        if record is None:
-            return
+    def _build_row_menu(self, record: FileRecord) -> QMenu:
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_styles(self._theme))
+        menu.addAction("Open").triggered.connect(lambda: self._open_record(record))
+        menu.addAction("Show in Finder").triggered.connect(
+            lambda: self._reveal_record(record)
+        )
+        menu.addAction("Restore").triggered.connect(lambda: self._restore_single(record))
+        menu.addSeparator()
+        expiry_menu = menu.addMenu("Change Expiration")
+        for label, duration in RETENTION_OPTIONS:
+            expiry_menu.addAction(label).triggered.connect(
+                lambda _checked=False, value=duration: self._set_retention(value, [record])
+            )
+        expiry_menu.addSeparator()
+        expiry_menu.addAction("Custom\u2026").triggered.connect(
+            lambda: self._set_custom_expiry([record])
+        )
+        return menu
+
+    def _show_row_menu(self, row: FileRow) -> QMenu:
+        menu = self._build_row_menu(row.record)
+        menu.popup(row.mapToGlobal(QPoint(row.width() - 28, row.height() - 4)))
+        return menu
+
+    def _open_row(self, row: FileRow) -> None:
+        self._open_record(row.record)
+
+    def _open_record(self, record: FileRecord) -> None:
         stored = self.store.stored_path(record)
         if not stored.is_file():
             self._notify_error(f"'{record.original_name}' is missing from TempBox storage.")
@@ -568,25 +911,20 @@ class MainWindow(QWidget):
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(stored))):
             self._notify_error(f"macOS could not open '{record.original_name}'.")
 
-    def _reveal_selected(self) -> None:
-        record = self._single_selected_record()
-        if record is None:
-            return
+    def _reveal_record(self, record: FileRecord) -> None:
         stored = self.store.stored_path(record)
         if not stored.is_file():
             self._notify_error(f"'{record.original_name}' is missing from TempBox storage.")
             return
-        completed = subprocess.run(["open", "-R", str(stored)], check=False, capture_output=True)
+        completed = subprocess.run(
+            ["open", "-R", str(stored)], check=False, capture_output=True
+        )
         if completed.returncode != 0:
             self._notify_error(f"Finder could not show '{record.original_name}'.")
 
-    def _restore_selected(self) -> None:
-        records = self._selected_records()
-        if not records:
-            return
-        if len(records) == 1:
-            self._restore_single(records[0])
-        else:
+    def _restore_checked(self) -> None:
+        records = self._checked_records()
+        if records:
             self._restore_many(records)
 
     def _restore_single(self, record: FileRecord) -> None:
@@ -617,7 +955,9 @@ class MainWindow(QWidget):
                 failures.append((record.original_name, "original folder no longer exists"))
                 continue
             if os.path.lexists(original):
-                failures.append((record.original_name, "a file already exists at the original place"))
+                failures.append(
+                    (record.original_name, "a file already exists at the original place")
+                )
                 continue
             try:
                 self.store.restore(record.id, original)
@@ -625,7 +965,7 @@ class MainWindow(QWidget):
                 failures.append((record.original_name, str(exc)))
             else:
                 restored += 1
-        self._refresh()
+        self._render_rows()
         parts = []
         if restored:
             parts.append(f"Restored {restored} {_plural(restored, 'file', 'files')}.")
@@ -634,9 +974,7 @@ class MainWindow(QWidget):
             parts.append(f"{count} {_plural(count, 'file', 'files')} failed.")
         self._set_status(" ".join(parts) if parts else "Nothing to restore.")
         if failures:
-            details = "\n".join(
-                f"\u2022 {name}: {reason}" for name, reason in failures[:8]
-            )
+            details = "\n".join(f"\u2022 {name}: {reason}" for name, reason in failures[:8])
             if len(failures) > 8:
                 details += "\n\u2026"
             QMessageBox.warning(
@@ -655,7 +993,9 @@ class MainWindow(QWidget):
         if not start_dir.is_dir():
             start_dir = Path.home()
         while True:
-            directory = QFileDialog.getExistingDirectory(self, "Choose a folder", str(start_dir))
+            directory = QFileDialog.getExistingDirectory(
+                self, "Choose a folder", str(start_dir)
+            )
             if not directory:
                 self._set_status("Restore cancelled.")
                 return
@@ -676,50 +1016,29 @@ class MainWindow(QWidget):
         try:
             restored = self.store.restore(record.id, target)
         except StorageError as exc:
-            self._refresh()
+            self._render_rows()
             self._notify_error(str(exc))
             return
-        self._refresh()
+        self._render_rows()
         self._set_status(f"Restored '{record.original_name}' to {restored}.")
 
-    # -- context menu --------------------------------------------------
+    # -- batch expiry menu ---------------------------------------------
 
-    def _show_context_menu(self, position) -> None:
-        index = self.table.indexAt(position)
-        if index.isValid():
-            selected_rows = {item.row() for item in self.table.selectionModel().selectedRows()}
-            if index.row() not in selected_rows:
-                self.table.clearSelection()
-                self.table.selectRow(index.row())
-        if not self._selected_records():
+    def _show_batch_expiry_menu(self) -> None:
+        records = self._checked_records()
+        if not records:
             return
-        menu = self._build_context_menu()
-        menu.exec(self.table.viewport().mapToGlobal(position))
-
-    def _build_context_menu(self) -> QMenu:
-        selected = self._selected_records()
-        single = len(selected) == 1
         menu = QMenu(self)
-        open_action = menu.addAction("Open")
-        open_action.setEnabled(single)
-        open_action.triggered.connect(self._open_selected)
-        reveal_action = menu.addAction("Show in Finder")
-        reveal_action.setEnabled(single)
-        reveal_action.triggered.connect(self._reveal_selected)
-        restore_action = menu.addAction("Restore")
-        restore_action.setEnabled(bool(selected))
-        restore_action.triggered.connect(self._restore_selected)
-        menu.addSeparator()
-        expiry_menu = menu.addMenu("Change Expiration")
+        menu.setStyleSheet(menu_styles(self._theme))
         for label, duration in RETENTION_OPTIONS:
-            action = expiry_menu.addAction(label)
-            action.triggered.connect(
-                lambda _checked=False, duration=duration: self._set_retention(duration)
+            menu.addAction(label).triggered.connect(
+                lambda _checked=False, value=duration: self._set_retention(value, records)
             )
-        expiry_menu.addSeparator()
-        custom_action = expiry_menu.addAction("Custom\u2026")
-        custom_action.triggered.connect(self._set_custom_expiry)
-        return menu
+        menu.addSeparator()
+        menu.addAction("Custom\u2026").triggered.connect(
+            lambda: self._set_custom_expiry(records)
+        )
+        menu.exec(self.expiration_button.mapToGlobal(QPoint(0, -8)))
 
     # -- misc ----------------------------------------------------------
 
@@ -728,186 +1047,44 @@ class MainWindow(QWidget):
         QMessageBox.critical(self, "TempBox", message)
 
     def _set_status(self, text: str) -> None:
-        self.status_label.setText(text)
-        self.status_label.setToolTip(text)
+        self._status_text = text
+        self.footer_status.setText(text)
+
+    def _on_application_state_changed(self, state: Qt.ApplicationState) -> None:
+        if state == Qt.ApplicationState.ApplicationActive:
+            return
+        if not self.isVisible():
+            return
+        if (
+            QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+        ):
+            return
+        self.hide()
+        self._auto_hidden_at = time.monotonic()
+
+    def consume_recent_auto_hide(self) -> bool:
+        if self._auto_hidden_at is None:
+            return False
+        hidden_seconds_ago = time.monotonic() - self._auto_hidden_at
+        self._auto_hidden_at = None
+        return hidden_seconds_ago <= AUTO_HIDE_REOPEN_GRACE
+
+    def clear_auto_hide_marker(self) -> None:
+        self._auto_hidden_at = None
 
     def closeEvent(self, event: QCloseEvent) -> None:
         event.ignore()
         self.hide()
 
 
-class ExpiryDialog(QDialog):
-    """Small dialog for choosing a custom expiry date and time."""
-
-    def __init__(self, current: datetime | None, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Custom expiry time")
-        self.setMinimumWidth(320)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 16)
-        layout.setSpacing(12)
-        layout.addWidget(QLabel("Move this file to the Trash at:"))
-
-        self.editor = QDateTimeEdit(self)
-        self.editor.setCalendarPopup(True)
-        self.editor.setDisplayFormat("yyyy-MM-dd HH:mm")
-        minimum = QDateTime.currentDateTime().addSecs(60)
-        self.editor.setMinimumDateTime(minimum)
-        if current is not None:
-            initial = QDateTime.fromSecsSinceEpoch(int(current.timestamp()))
-        else:
-            default = datetime.now(timezone.utc) + DEFAULT_RETENTION
-            initial = QDateTime.fromSecsSinceEpoch(int(default.timestamp()))
-        if initial < minimum:
-            initial = minimum
-        self.editor.setDateTime(initial)
-        layout.addWidget(self.editor)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def selected_expiry(self) -> datetime:
-        return datetime.fromtimestamp(self.editor.dateTime().toSecsSinceEpoch(), timezone.utc)
-
-
-class SettingsDialog(QDialog):
-    """Small settings dialog: default retention and launch at login."""
-
-    def __init__(self, window: MainWindow) -> None:
-        super().__init__(window)
-        self.window = window
-        self.setWindowTitle("TempBox Settings")
-        self.setMinimumWidth(440)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 16)
-        layout.setSpacing(10)
-
-        layout.addWidget(QLabel("Default retention for new files"))
-        self.retention_combo = QComboBox()
-        for label, duration in RETENTION_OPTIONS:
-            self.retention_combo.addItem(label, duration)
-        for index, (_label, duration) in enumerate(RETENTION_OPTIONS):
-            if duration == window.store.default_retention:
-                self.retention_combo.setCurrentIndex(index)
-                break
-        self.retention_combo.currentIndexChanged.connect(self._on_retention_changed)
-        layout.addWidget(self.retention_combo)
-
-        self.autostart_checkbox = QCheckBox("Launch TempBox at login")
-        self.autostart_checkbox.setChecked(autostart.is_enabled())
-        self.autostart_checkbox.toggled.connect(self._on_autostart_toggled)
-        layout.addWidget(self.autostart_checkbox)
-
-        hint = _muted_label(
-            "Login launch starts TempBox hidden in the menu bar. While TempBox runs "
-            "as a Python script, it uses the current Python and project paths; move "
-            "either and toggle this setting off and on again."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self.note_label = _muted_label("")
-        self.note_label.setWordWrap(True)
-        layout.addWidget(self.note_label)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _on_retention_changed(self, index: int) -> None:
-        duration = self.retention_combo.itemData(index)
-        if duration is None:
-            return
-        self.window.set_default_retention(duration)
-        self.note_label.setText(
-            f"New files will be kept for {_duration_label(duration)}."
-        )
-
-    def _on_autostart_toggled(self, enabled: bool) -> None:
-        try:
-            autostart.set_enabled(enabled)
-        except OSError as exc:
-            self.autostart_checkbox.blockSignals(True)
-            self.autostart_checkbox.setChecked(not enabled)
-            self.autostart_checkbox.blockSignals(False)
-            QMessageBox.warning(
-                self,
-                "Launch at Login",
-                f"TempBox could not update the login item:\n{exc}",
-            )
-            return
-        state = "enabled" if enabled else "disabled"
-        self.note_label.setText(f"Launch at login {state} for the next login.")
-
-
-def _muted_label(text: str = "") -> QLabel:
-    label = QLabel(text)
-    label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
-    return label
-
-
-def _plural(count: int, singular: str, plural: str) -> str:
-    return singular if count == 1 else plural
-
-
 def _stats_text(count: int, total_size: int) -> str:
     if count == 0:
         return "0 files"
-    return f"{count} {_plural(count, 'file', 'files')} \u00b7 {_format_size(total_size)}"
-
-
-def _empty_text(has_files: bool, searching: bool) -> str:
-    if not has_files:
-        return "Drop files here.\nWe'll take care of the rest."
-    if searching:
-        return "No files match your search."
-    return "No files to show."
-
-
-def _duration_label(duration: timedelta) -> str:
-    for label, option in RETENTION_OPTIONS:
-        if option == duration:
-            return label
-    return "1 day"
+    return f"{count} {_plural(count, 'file', 'files')} \u00b7 {format_size(total_size)}"
 
 
 def _expiry_sort_key(record: FileRecord) -> datetime:
     if record.expires_at is None:
         return datetime.max.replace(tzinfo=timezone.utc)
     return datetime.fromisoformat(record.expires_at)
-
-
-def _format_size(size: int) -> str:
-    if size < 1024:
-        return f"{size} B"
-    value = float(size)
-    units = ("KB", "MB", "GB", "TB")
-    for index, unit in enumerate(units):
-        value /= 1024.0
-        if value < 1024.0 or index == len(units) - 1:
-            return f"{value:.1f} {unit}"
-    return f"{size} B"
-
-
-def _format_added(added_at: str) -> str:
-    try:
-        moment = datetime.fromisoformat(added_at)
-    except ValueError:
-        return added_at
-    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
-
-
-def _format_expiry(expires_at: str | None) -> str:
-    if not expires_at:
-        return "\u2014"
-    try:
-        moment = datetime.fromisoformat(expires_at)
-    except ValueError:
-        return expires_at
-    return moment.astimezone().strftime("%Y-%m-%d %H:%M")

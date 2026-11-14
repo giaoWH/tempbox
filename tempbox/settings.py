@@ -19,19 +19,31 @@ class AppSettings:
     """User preferences that survive app restarts."""
 
     default_retention: timedelta = DEFAULT_RETENTION
+    pause_auto_cleanup: bool = False
+    remind_before_expiry: bool = True
 
     @classmethod
     def load(cls, root: Path | str) -> "AppSettings":
         path = Path(root) / SETTINGS_FILENAME
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            seconds = int(data["default_retention_seconds"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError):
             return cls()
-        for _label, duration in RETENTION_OPTIONS:
-            if duration.total_seconds() == seconds:
-                return cls(duration)
-        return cls()
+        if not isinstance(data, dict):
+            return cls()
+
+        retention = DEFAULT_RETENTION
+        seconds = data.get("default_retention_seconds")
+        if isinstance(seconds, int):
+            for _label, duration in RETENTION_OPTIONS:
+                if duration.total_seconds() == seconds:
+                    retention = duration
+                    break
+        return cls(
+            default_retention=retention,
+            pause_auto_cleanup=bool(data.get("pause_auto_cleanup", False)),
+            remind_before_expiry=bool(data.get("remind_before_expiry", True)),
+        )
 
     def save(self, root: Path | str) -> None:
         root = Path(root)
@@ -41,6 +53,8 @@ class AppSettings:
         payload = {
             "version": SETTINGS_VERSION,
             "default_retention_seconds": int(self.default_retention.total_seconds()),
+            "pause_auto_cleanup": self.pause_auto_cleanup,
+            "remind_before_expiry": self.remind_before_expiry,
         }
         try:
             with open(temporary_path, "w", encoding="utf-8") as handle:

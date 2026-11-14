@@ -1,7 +1,8 @@
-# Declarative record of the TempBox environment (Phase 2).
+# Declarative runtime environment for TempBox.
+#
 # If `conda env create` stops with a CondaToSNonInteractiveError about the Anaconda
 # `defaults` channel, use the explicit `conda create --override-channels` commands
-# in README.md instead (they bypass the `defaults` channel).
+# in docs/DEVELOPMENT.md instead (they bypass the `defaults` channel).
 name: tempbox
 channels:
   - conda-forge

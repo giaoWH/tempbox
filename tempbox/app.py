@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from .macos import activate_application, hide_dock_icon
+from .paths import APP_NAME, data_dir
 from .storage import FileStore, StorageError
 from .window import MainWindow
 
-APP_NAME = "TempBox"
-DATA_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
+DATA_DIR = data_dir()
 
 
 def main() -> int:
@@ -93,6 +92,23 @@ def _show_window(window: MainWindow, tray: QSystemTrayIcon | None = None) -> Non
         QTimer.singleShot(250, lambda: _position_window(window, tray))
 
 
+def _quit_application(
+    app: QApplication,
+    tray: QSystemTrayIcon,
+    menu: QMenu | None = None,
+) -> None:
+    """Hide the menu bar icon before quitting.
+
+    Quitting directly from a right-click context menu on macOS can leave a stale
+    status item until the next click; hiding the tray and letting the hide finish
+    on the next event-loop iteration avoids that.
+    """
+    if menu is not None:
+        menu.close()
+    tray.hide()
+    QTimer.singleShot(0, app.quit)
+
+
 def _toggle_window(window: MainWindow, tray: QSystemTrayIcon | None = None) -> None:
     if window.isVisible():
         window.hide()
@@ -128,14 +144,23 @@ def _position_window(window: MainWindow, tray: QSystemTrayIcon | None) -> None:
         return
 
     available = screen.availableGeometry()
+    margin = window.SHADOW_MARGIN
+    content_width = window.width() - margin * 2
+    content_height = window.height() - margin * 2
     if not tray_rect.isNull():
-        x = tray_rect.center().x() - window.width() // 2
-        y = tray_rect.bottom() + 8
+        x = tray_rect.center().x() - content_width // 2 - margin
+        y = tray_rect.bottom() + 8 - margin
     else:
-        x = available.right() - window.width() - 16
-        y = available.top() + 8
-    x = max(available.left() + 8, min(x, available.right() - window.width() - 8))
-    y = max(available.top() + 8, min(y, available.bottom() - window.height() - 8))
+        x = available.right() - content_width - 8 - margin
+        y = available.top() + 8 - margin
+    x = max(
+        available.left() + 8 - margin,
+        min(x, available.right() - 8 - margin - content_width),
+    )
+    y = max(
+        available.top() + 8 - margin,
+        min(y, available.bottom() - 8 - margin - content_height),
+    )
     window.move(x, y)
 
 
@@ -144,11 +169,9 @@ def _create_tray(app: QApplication, window: MainWindow) -> QSystemTrayIcon:
     tray.setToolTip(APP_NAME)
 
     menu = QMenu()
-    open_action = menu.addAction("Open TempBox")
-    menu.addSeparator()
     quit_action = menu.addAction("Quit TempBox")
-    open_action.triggered.connect(lambda: _show_window(window, tray))
-    quit_action.triggered.connect(app.quit)
+    quit_action.triggered.connect(lambda: _quit_application(app, tray, menu))
+    window.quit_requested.connect(lambda: _quit_application(app, tray))
 
     def on_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
         action = _tray_action(reason, QApplication.mouseButtons())
@@ -159,6 +182,16 @@ def _create_tray(app: QApplication, window: MainWindow) -> QSystemTrayIcon:
 
     tray.activated.connect(on_activated)
     tray.show()
+    app.aboutToQuit.connect(tray.hide)
+    window.set_notifier(
+        lambda title, message: tray.showMessage(
+            title,
+            message,
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
+    )
+    QTimer.singleShot(1200, window.check_expiry_reminders)
     return tray
 
 
