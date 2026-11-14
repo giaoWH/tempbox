@@ -1,5 +1,7 @@
 # TempBox User Guide
 
+English | [简体中文](USAGE.zh-CN.md)
+
 TempBox keeps temporary files out of the way and moves them to the macOS Trash when
 their time is up. It runs as a menu bar app with a compact floating panel.
 

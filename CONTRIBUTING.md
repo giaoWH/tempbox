@@ -1,5 +1,7 @@
 # Contributing to TempBox
 
+English | [简体中文](CONTRIBUTING.zh-CN.md)
+
 TempBox is a small macOS menu bar utility. Contributions are welcome once the project's
 license is chosen; until then, please open an issue before sending substantial code.
 

@@ -1,5 +1,7 @@
 # TempBox Development Guide
 
+English | [简体中文](DEVELOPMENT.zh-CN.md)
+
 This document is for developers running TempBox from source. For user-facing behavior
 see [USAGE.md](USAGE.md).
 

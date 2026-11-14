@@ -1,5 +1,7 @@
 # Changelog
 
+English | [简体中文](CHANGELOG.zh-CN.md)
+
 TempBox is still pre-release. Version headings below describe development phases; no
 GitHub Releases or installable `.app` builds exist yet.
 

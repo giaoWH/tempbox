@@ -2,6 +2,8 @@
 
 **Temporary files deserve a temporary home.**
 
+English | [简体中文](README.zh-CN.md)
+
 TempBox is a lightweight macOS menu bar app for files that should not live on the
 Desktop forever. Drop a file into the floating panel, choose how long to keep it, and
 TempBox stores it in its own folder until it is automatically moved to the macOS
