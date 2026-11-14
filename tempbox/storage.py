@@ -124,6 +124,7 @@ class FileStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self.records: dict[str, FileRecord] = {}
+        self.default_retention: timedelta = DEFAULT_RETENTION
 
     @property
     def records_path(self) -> Path:
@@ -250,6 +251,30 @@ class FileStore:
             raise StorageError(f"Could not save the retention time: {exc}") from exc
         return updated
 
+    def set_expiries(self, record_ids: Iterable[str], expires_at: datetime) -> int:
+        """Set the same expiry time for several files with a single index write."""
+        if expires_at.tzinfo is None:
+            raise StorageError("Expiry time must include a time zone.")
+        timestamp = expires_at.astimezone(timezone.utc).isoformat(timespec="seconds")
+        previous: dict[str, FileRecord] = {}
+        for record_id in record_ids:
+            record = self.records.get(record_id)
+            if record is None or record_id in previous:
+                continue
+            previous[record_id] = record
+            self.records[record_id] = replace(
+                record, expires_at=timestamp, trash_error=None
+            )
+        if not previous:
+            raise StorageError("No files are selected.")
+        try:
+            self._save()
+        except OSError as exc:
+            for record_id, record in previous.items():
+                self.records[record_id] = record
+            raise StorageError(f"Could not save the retention times: {exc}") from exc
+        return len(previous)
+
     def cleanup_expired(self, now: datetime | None = None) -> CleanupResult:
         """Move expired files to the macOS Trash and update the index.
 
@@ -343,7 +368,7 @@ class FileStore:
             raise StorageError(f"Could not move the file into TempBox: {exc}") from exc
 
         added_at = datetime.now().astimezone()
-        expires_at = added_at.astimezone(timezone.utc) + DEFAULT_RETENTION
+        expires_at = added_at.astimezone(timezone.utc) + self.default_retention
         record = FileRecord(
             id=record_id,
             original_name=source.name,

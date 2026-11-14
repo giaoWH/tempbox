@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QPointF, QRectF, Qt
+from PySide6.QtCore import QLockFile, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
@@ -18,7 +18,9 @@ DATA_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    hidden_launch = "--hidden" in sys.argv[1:]
+    arguments = [argument for argument in sys.argv if argument != "--hidden"]
+    app = QApplication(arguments)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
@@ -27,51 +29,114 @@ def main() -> int:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        QMessageBox.critical(None, APP_NAME, f"Could not create the TempBox data folder:\n{exc}")
+        _show_startup_error(f"Could not create the TempBox data folder:\n{exc}")
         return 1
 
     lock = QLockFile(str(DATA_DIR / ".instance.lock"))
     if not lock.tryLock(100):
         if not (lock.removeStaleLockFile() and lock.tryLock(100)):
-            QMessageBox.warning(None, APP_NAME, "TempBox is already running.")
+            if hidden_launch:
+                print("TempBox is already running.", file=sys.stderr)
+            else:
+                QMessageBox.warning(None, APP_NAME, "TempBox is already running.")
             return 1
 
     store = FileStore(DATA_DIR)
     try:
         problems = store.load()
     except StorageError as exc:
-        QMessageBox.critical(None, APP_NAME, str(exc))
+        _show_startup_error(str(exc), hidden_launch)
         return 1
 
     app.setWindowIcon(_app_icon())
     window = MainWindow(store)
     tray = _create_tray(app, window)
-    _show_window(window)
+    if hidden_launch:
+        window.hide()
+    else:
+        # The menu bar status item only gets its geometry after the event loop
+        # starts, so defer the first show slightly to place the window correctly.
+        QTimer.singleShot(180, lambda: _show_window(window, tray))
 
     if problems:
-        QMessageBox.warning(
-            None,
-            APP_NAME,
-            "TempBox needs your attention:\n\n" + "\n".join(problems),
-        )
+        if hidden_launch:
+            for problem in problems:
+                print(f"TempBox: {problem}", file=sys.stderr)
+        else:
+            QMessageBox.warning(
+                None,
+                APP_NAME,
+                "TempBox needs your attention:\n\n" + "\n".join(problems),
+            )
 
     exit_code = app.exec()
     tray.hide()
     return exit_code
 
 
-def _show_window(window: MainWindow) -> None:
+def _show_startup_error(message: str, hidden_launch: bool = False) -> None:
+    if hidden_launch:
+        print(f"TempBox: {message}", file=sys.stderr)
+    else:
+        QMessageBox.critical(None, APP_NAME, message)
+
+
+def _show_window(window: MainWindow, tray: QSystemTrayIcon | None = None) -> None:
+    window.clear_auto_hide_marker()
+    _position_window(window, tray)
     activate_application()
     window.show()
     window.raise_()
     window.activateWindow()
+    if tray is not None:
+        # Refine the position once the status item geometry is available.
+        QTimer.singleShot(250, lambda: _position_window(window, tray))
 
 
-def _toggle_window(window: MainWindow) -> None:
+def _toggle_window(window: MainWindow, tray: QSystemTrayIcon | None = None) -> None:
     if window.isVisible():
         window.hide()
+    elif window.consume_recent_auto_hide():
+        # The window was just auto-hidden by this same menu bar click, so the
+        # user is trying to hide it: keep it hidden.
+        return
     else:
-        _show_window(window)
+        _show_window(window, tray)
+
+
+def _valid_tray_rect(tray: QSystemTrayIcon | None) -> QRect:
+    if tray is None:
+        return QRect()
+    rect = tray.geometry()
+    # Before the event loop starts the status item may report a placeholder
+    # geometry such as QRect(0, 900, 38, 0); ignore that.
+    if rect.width() <= 0 or rect.height() <= 0:
+        return QRect()
+    if rect.top() < 0 or rect.top() > 100:
+        return QRect()
+    return rect
+
+
+def _position_window(window: MainWindow, tray: QSystemTrayIcon | None) -> None:
+    tray_rect = _valid_tray_rect(tray)
+    screen = None
+    if not tray_rect.isNull():
+        screen = QApplication.screenAt(tray_rect.center())
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    if screen is None:
+        return
+
+    available = screen.availableGeometry()
+    if not tray_rect.isNull():
+        x = tray_rect.center().x() - window.width() // 2
+        y = tray_rect.bottom() + 8
+    else:
+        x = available.right() - window.width() - 16
+        y = available.top() + 8
+    x = max(available.left() + 8, min(x, available.right() - window.width() - 8))
+    y = max(available.top() + 8, min(y, available.bottom() - window.height() - 8))
+    window.move(x, y)
 
 
 def _create_tray(app: QApplication, window: MainWindow) -> QSystemTrayIcon:
@@ -82,7 +147,7 @@ def _create_tray(app: QApplication, window: MainWindow) -> QSystemTrayIcon:
     open_action = menu.addAction("Open TempBox")
     menu.addSeparator()
     quit_action = menu.addAction("Quit TempBox")
-    open_action.triggered.connect(lambda: _show_window(window))
+    open_action.triggered.connect(lambda: _show_window(window, tray))
     quit_action.triggered.connect(app.quit)
 
     def on_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
@@ -90,7 +155,7 @@ def _create_tray(app: QApplication, window: MainWindow) -> QSystemTrayIcon:
         if action == "menu":
             menu.exec(QCursor.pos())
         elif action == "toggle":
-            _toggle_window(window)
+            _toggle_window(window, tray)
 
     tray.activated.connect(on_activated)
     tray.show()

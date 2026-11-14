@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -16,11 +17,12 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PySide6.QtCore import QItemSelectionModel, QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDropEvent
 from PySide6.QtWidgets import QApplication
 
 from tempbox.storage import RETENTION_OPTIONS, FileStore
+from tempbox.app import _toggle_window
 from tempbox.window import ExpiryDialog, MainWindow
 
 
@@ -69,6 +71,17 @@ class MainWindowTest(unittest.TestCase):
     def _import_record(self, name: str):
         self._drop(self._make_source(name))
         return self.store.list_files()[0]
+
+    def _select_rows(self, *rows: int) -> None:
+        model = self.window.table.selectionModel()
+        model.clearSelection()
+        for row in rows:
+            index = self.window.table.model().index(row, 0)
+            model.select(
+                index,
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
 
     # -- empty state ---------------------------------------------------
 
@@ -126,7 +139,8 @@ class MainWindowTest(unittest.TestCase):
         self.assertEqual(len(self.store.list_files()), 1)
         self.assertEqual(self.window.table.rowCount(), 1)
         self.assertEqual(self.window.table.item(0, 0).text(), "notes.txt")
-        self.assertEqual(self.window.count_label.text(), "1 file")
+        self.assertTrue(self.window.count_label.text().startswith("1 file"))
+        self.assertIn("5 B", self.window.count_label.text())
         self.assertIs(self.window.content.currentWidget(), self.window.table)
         self.assertIn("Imported 1 file", self.window.status_label.text())
 
@@ -137,7 +151,7 @@ class MainWindowTest(unittest.TestCase):
         self._drop(first, second)
 
         self.assertEqual(self.window.table.rowCount(), 2)
-        self.assertEqual(self.window.count_label.text(), "2 files")
+        self.assertTrue(self.window.count_label.text().startswith("2 files"))
         names = {self.window.table.item(row, 0).text() for row in range(2)}
         self.assertEqual(names, {"one.txt", "two.txt"})
         self.assertIn("Imported 2 files", self.window.status_label.text())
@@ -295,6 +309,232 @@ class MainWindowTest(unittest.TestCase):
         self.assertIsNotNone(expiry.tzinfo)
         self.assertEqual(expiry.utcoffset(), timedelta(0))
         self.assertGreater(expiry, datetime.now(timezone.utc) + timedelta(hours=23))
+
+
+    # -- Phase 3: stats, search, sort, batch, settings -----------------
+
+    def test_header_shows_count_and_total_size(self) -> None:
+        self._drop(
+            self._make_source("a.bin", b"x" * 1024),
+            self._make_source("b.bin", b"y" * 1024),
+        )
+
+        text = self.window.count_label.text()
+
+        self.assertIn("2 files", text)
+        self.assertIn("2.0 KB", text)
+
+    def test_search_filters_files(self) -> None:
+        self._drop(
+            self._make_source("alpha.txt"),
+            self._make_source("beta.txt"),
+            self._make_source("alphabet.txt"),
+        )
+
+        self.window.search_edit.setText("alpha")
+        self.assertEqual(self.window.table.rowCount(), 2)
+
+        self.window.search_edit.setText("ALPHA")
+        self.assertEqual(self.window.table.rowCount(), 2)
+
+        self.window.search_edit.setText("zzz")
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertEqual(self.window.empty_label.text(), "No files match your search.")
+
+        self.window.search_edit.clear()
+        self.assertEqual(self.window.table.rowCount(), 3)
+
+    def test_sort_changes_row_order(self) -> None:
+        self._drop(
+            self._make_source("beta.txt", b"22"),
+            self._make_source("alpha.txt", b"1"),
+            self._make_source("gamma.txt", b"333"),
+        )
+
+        self.window.sort_combo.setCurrentIndex(self.window.sort_combo.findData("name"))
+        names = [self.window.table.item(row, 0).text() for row in range(3)]
+        self.assertEqual(names, ["alpha.txt", "beta.txt", "gamma.txt"])
+
+        self.window.sort_combo.setCurrentIndex(self.window.sort_combo.findData("size"))
+        names = [self.window.table.item(row, 0).text() for row in range(3)]
+        self.assertEqual(names, ["gamma.txt", "beta.txt", "alpha.txt"])
+
+    def test_sort_by_expiry_puts_no_expiry_last(self) -> None:
+        self._drop(
+            self._make_source("later.txt"),
+            self._make_source("soon.txt"),
+            self._make_source("never.txt"),
+        )
+        records = {record.original_name: record for record in self.store.list_files()}
+        self.store.set_expiry(
+            records["soon.txt"].id, datetime.now(timezone.utc) + timedelta(hours=1)
+        )
+        self.store.set_expiry(
+            records["later.txt"].id, datetime.now(timezone.utc) + timedelta(days=3)
+        )
+        self.store.records[records["never.txt"].id] = replace(
+            records["never.txt"], expires_at=None
+        )
+
+        self.window.sort_combo.setCurrentIndex(self.window.sort_combo.findData("expires"))
+        names = [self.window.table.item(row, 0).text() for row in range(3)]
+
+        self.assertEqual(names, ["soon.txt", "later.txt", "never.txt"])
+
+    def test_batch_expiry_updates_selected_files(self) -> None:
+        self._drop(
+            self._make_source("one.txt"),
+            self._make_source("two.txt"),
+            self._make_source("three.txt"),
+        )
+        self._select_rows(0, 1)
+        selected_ids = {record.id for record in self.window._selected_records()}
+        self.assertEqual(len(selected_ids), 2)
+
+        started = datetime.now(timezone.utc)
+        self.window._set_retention(timedelta(days=7))
+
+        for record in self.store.list_files():
+            expires_at = datetime.fromisoformat(record.expires_at)
+            if record.id in selected_ids:
+                self.assertGreaterEqual(
+                    expires_at, started + timedelta(days=7) - timedelta(seconds=2)
+                )
+            else:
+                self.assertGreater(
+                    expires_at, datetime.now(timezone.utc) + timedelta(hours=23)
+                )
+        self.assertEqual(len(self.window._selected_records()), 2)
+        self.assertIn("2 files", self.window.status_label.text())
+
+    def test_batch_restore_restores_selected_files(self) -> None:
+        first = self._make_source("r1.txt", b"one")
+        second = self._make_source("r2.txt", b"two")
+        self._drop(first, second)
+        self._select_rows(0, 1)
+
+        self.window._restore_selected()
+
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertEqual(self.store.list_files(), [])
+        self.assertIn("Restored 2 files", self.window.status_label.text())
+
+    def test_batch_restore_reports_partial_failure(self) -> None:
+        first = self._make_source("keep.txt", b"one")
+        second = self._make_source("lost.txt", b"two")
+        self._drop(first, second)
+        lost = next(
+            record for record in self.store.list_files() if record.original_name == "lost.txt"
+        )
+        self.store.stored_path(lost).unlink()
+        self.window._refresh()
+        self._select_rows(0, 1)
+
+        with mock.patch("tempbox.window.QMessageBox.warning") as warning:
+            self.window._restore_selected()
+
+        warning.assert_called_once()
+        self.assertTrue(first.is_file())
+        self.assertFalse(second.exists())
+        self.assertEqual(len(self.store.list_files()), 1)
+        status = self.window.status_label.text()
+        self.assertIn("Restored 1 file", status)
+        self.assertIn("1 file failed", status)
+
+    def test_context_menu_contains_file_actions(self) -> None:
+        self._drop(self._make_source("menu.txt"))
+        self.window.table.selectRow(0)
+
+        menu = self.window._build_context_menu()
+        self.addCleanup(menu.deleteLater)
+        texts = [action.text() for action in menu.actions()]
+
+        self.assertIn("Open", texts)
+        self.assertIn("Show in Finder", texts)
+        self.assertIn("Restore", texts)
+        self.assertIn("Change Expiration", texts)
+
+    def test_default_retention_setting_persists_and_only_affects_new_files(self) -> None:
+        old = self._import_record("old.txt")
+
+        self.window.set_default_retention(timedelta(hours=1))
+
+        self.assertEqual(self.store.get(old.id).expires_at, old.expires_at)
+        settings_path = self.store.root / "settings.json"
+        self.assertTrue(settings_path.is_file())
+
+        self._drop(self._make_source("new.txt"))
+        new = next(
+            record for record in self.store.list_files() if record.original_name == "new.txt"
+        )
+        expires_at = datetime.fromisoformat(new.expires_at)
+        self.assertGreaterEqual(
+            expires_at, datetime.now(timezone.utc) + timedelta(minutes=59)
+        )
+        self.assertLessEqual(
+            expires_at, datetime.now(timezone.utc) + timedelta(hours=1, minutes=1)
+        )
+
+        from tempbox.settings import AppSettings
+
+        self.assertEqual(
+            AppSettings.load(self.store.root).default_retention, timedelta(hours=1)
+        )
+
+    def test_settings_dialog_shows_current_default(self) -> None:
+        from tempbox.window import SettingsDialog
+
+        self.window.set_default_retention(timedelta(days=7))
+        with mock.patch("tempbox.window.autostart.is_enabled", return_value=False):
+            dialog = SettingsDialog(self.window)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.retention_combo.currentText(), "7 days")
+        self.assertFalse(dialog.autostart_checkbox.isChecked())
+
+    def test_application_deactivate_hides_window(self) -> None:
+        self.window.show()
+        QApplication.processEvents()
+        self.assertTrue(self.window.isVisible())
+
+        self.window._on_application_state_changed(Qt.ApplicationState.ApplicationInactive)
+
+        self.assertFalse(self.window.isVisible())
+
+    def test_tray_click_after_auto_hide_stays_hidden(self) -> None:
+        self.window.show()
+        QApplication.processEvents()
+        # Clicking the menu bar icon can deactivate the app just before the tray
+        # activation is delivered; the toggle must still hide (not re-show).
+        self.window._on_application_state_changed(Qt.ApplicationState.ApplicationInactive)
+        self.assertFalse(self.window.isVisible())
+
+        with mock.patch("tempbox.app.activate_application"), mock.patch(
+            "tempbox.app._position_window"
+        ):
+            _toggle_window(self.window, None)
+        self.assertFalse(self.window.isVisible())
+
+        with mock.patch("tempbox.app.activate_application"), mock.patch(
+            "tempbox.app._position_window"
+        ):
+            _toggle_window(self.window, None)
+        self.assertTrue(self.window.isVisible())
+
+    def test_stale_auto_hide_marker_allows_reopen(self) -> None:
+        self.window.show()
+        QApplication.processEvents()
+        self.window.hide()
+        self.window._auto_hidden_at = time.monotonic() - 2.0
+
+        with mock.patch("tempbox.app.activate_application"), mock.patch(
+            "tempbox.app._position_window"
+        ):
+            _toggle_window(self.window, None)
+
+        self.assertTrue(self.window.isVisible())
 
 
 if __name__ == "__main__":

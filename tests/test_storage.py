@@ -616,6 +616,39 @@ class FileStoreTest(unittest.TestCase):
         self.assertEqual(payload["version"], 2)
         self.assertEqual(payload["files"][0]["id"], record_id)
 
+    # -- Phase 3: default retention and batch updates ------------------
+
+    def test_import_uses_store_default_retention(self) -> None:
+        self.store.default_retention = timedelta(days=7)
+        source = self._make_source("week.txt")
+
+        record = self.store.import_files([source]).added[0]
+
+        expires_at = datetime.fromisoformat(record.expires_at)
+        self.assertGreater(
+            expires_at, datetime.now(timezone.utc) + timedelta(days=6, hours=23)
+        )
+        self.assertLess(expires_at, datetime.now(timezone.utc) + timedelta(days=7, hours=1))
+
+    def test_set_expiries_updates_multiple_files(self) -> None:
+        first = self.store.import_files([self._make_source("one.txt")]).added[0]
+        second = self.store.import_files([self._make_source("two.txt")]).added[0]
+        expires_at = datetime.now(timezone.utc) + timedelta(days=2)
+
+        updated = self.store.set_expiries([first.id, second.id], expires_at)
+
+        self.assertEqual(updated, 2)
+        for record_id in (first.id, second.id):
+            record = self.store.get(record_id)
+            self.assertEqual(
+                datetime.fromisoformat(record.expires_at), expires_at.replace(microsecond=0)
+            )
+        self.assertEqual(len(self._reload().list_files()), 2)
+
+    def test_set_expiries_rejects_empty_selection(self) -> None:
+        with self.assertRaises(StorageError):
+            self.store.set_expiries([], datetime.now(timezone.utc) + timedelta(days=1))
+
 
 if __name__ == "__main__":
     unittest.main()

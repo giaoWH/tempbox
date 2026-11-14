@@ -6,9 +6,10 @@ TempBox is a small, native macOS menu bar app that gives temporary files a dedic
 home. Drag files from Finder into TempBox; they are moved into TempBox's own folder,
 kept for a chosen period, and then automatically moved to the macOS Trash.
 
-> **Status: Phase 2 (v0.2).** Retention times, live countdowns and automatic Trash
-> clean-up work. Search, batch actions, global settings, Finder integration and
-> packaging are planned for later phases.
+> **Status: Phase 3 (v0.3).** File management, retention, automatic Trash clean-up,
+> search, sorting, multi-select batch actions, a configurable default retention,
+> launch at login and light/dark appearance are implemented. Finder integration,
+> packaging and signing are planned for Phase 4.
 
 ## Requirements
 
@@ -39,33 +40,46 @@ commands above, which bypass the `defaults` channel.
 python main.py
 ```
 
-The main window opens and a box icon appears in the macOS menu bar.
+The main window opens under the menu bar icon and a box icon appears in the menu bar.
 
 ## Usage
 
-- **Click the menu bar icon** to show or hide the main window. TempBox has no Dock
-  icon; it lives only in the menu bar.
-- **Drag files from Finder** into the window (single or multiple files). Folders,
-  symbolic links and other special files are rejected.
-- **New files are kept for 1 day by default.** Select a file and open the
-  **Retention** menu to choose 1 hour, 1 day, 7 days, 30 days, or a custom date and
-  time. Custom times must be in the future.
-- The **Remaining** column updates every 30 seconds. It turns amber when less than
-  one hour is left and red when the file is expired or its clean-up failed. Hover a
-  failed row to see the error.
-- **When a file expires it is moved to the macOS Trash**, so it can still be
-  recovered from the Trash. An overdue check also runs when the app starts.
-  Failed clean-ups are retried on the next 30-second check.
-- Files imported by Phase 1 show **No expiry** and are never cleaned up
-  automatically; use the Retention menu to give them a deadline.
-- Select a file and use **Open**, **Show in Finder** or **Restore**. Restore puts
-  the file back at its original path (or asks for another folder if needed) and
-  never overwrites existing files.
-- Closing the window hides it; TempBox keeps running in the menu bar.
-- **Quit** with the window's **Quit** button (bottom right) or `Cmd+Q` while the
-  window is focused. On macOS 27, Qt reports status item clicks without mouse button
-  information, so a right-click behaves like a normal click and the tray menu may
-  not open on that macOS version.
+- **Click the menu bar icon** to show or hide the window. It appears just below the
+  icon, centered on it, and takes focus. Clicking outside TempBox hides it again.
+  Closing the window also hides it; TempBox keeps running in the menu bar.
+- **Drag files from Finder** into the window. New files use the current default
+  retention (1 day unless changed). Folders and symbolic links are rejected.
+- **Search** by file name with the search field (case-insensitive, live filtering).
+  **Sort** by added time, name, size or expiry time in the sort menu.
+- **Select one or more files** (Command/Shift click). The bottom buttons and the
+  right-click menu work on the selection:
+  - **Open**, **Show in Finder** (single selection only)
+  - **Restore** — restores all selected files to their original paths; conflicts
+    and missing folders are reported without affecting the other files. A single
+    selected file can still be restored to a folder of your choice.
+  - **Expiration** / **Change Expiration** — 1 hour, 1 day, 7 days, 30 days, or a
+    custom date and time. Applied to all selected files.
+- New files expire by default after the configured default retention; expired files
+  are moved to the macOS Trash and can be recovered from there. An overdue check
+  also runs at startup; failed clean-ups are retried every 30 seconds.
+- Files imported by Phase 1 show **No expiry** and are never cleaned automatically.
+- The header shows the total number of files and their combined size.
+- **Settings…** (bottom right) configures the default retention for new files and
+  whether TempBox launches at login. Closing the window hides it; use **Quit** or
+  `Cmd+Q` to exit.
+- On macOS 27, Qt reports status item clicks without mouse button information, so a
+  right-click behaves like a normal click and the tray menu may not open. All file
+  actions are also available in the window and its context menu.
+
+### Launch at login
+
+Enabling it writes a user LaunchAgent:
+`~/Library/LaunchAgents/com.tempbox.app.plist`. It starts TempBox with `--hidden`
+(menu bar only) on the next login and appends output to `~/Library/Logs/TempBox.log`.
+While TempBox runs as a Python script, the agent embeds the current Python
+interpreter and project paths; if either moves, turn the setting off and on again.
+Because the agent is written but not loaded immediately, enabling it never starts a
+second copy of the running app.
 
 ## Data location
 
@@ -73,6 +87,7 @@ The main window opens and a box icon appears in the macOS menu bar.
 ~/Library/Application Support/TempBox/
 ├── files/<uuid>/<original-name>   # files managed by TempBox
 ├── records.json                   # metadata index (atomic writes, version 2)
+├── settings.json                  # default retention preference (atomic writes)
 └── .instance.lock                 # single-instance lock
 ```
 
@@ -99,21 +114,29 @@ python -m unittest discover -s tests -t . -v
 ```
 
 Storage tests mock `send2trash`; window tests use Qt's `offscreen` platform. The
-real macOS Trash behaviour was verified manually with throwaway files. Menu bar
-clicks and real Finder drags are verified manually (see the Phase 2 acceptance
-notes).
+real macOS Trash behaviour and the light/dark appearance were verified manually with
+throwaway files. Menu bar clicks, click-outside hiding and the login launch itself
+are verified manually (see the Phase 3 acceptance notes).
 
-## Known limitations (Phase 2)
+## Known limitations (Phase 3)
 
-- The default retention is fixed at 1 day; it is not configurable yet (Phase 3).
-- No search, sorting, batch operations or settings page yet (Phase 3).
-- Clean-up and file moves run on the GUI thread; fine for typical temporary files.
-- Failed clean-ups are retried every 30 seconds while the app is running; there is
-  no separate retry schedule or backoff.
+- The default retention applies to newly imported files only; existing files keep
+  their own expiry times.
+- No batch permanent deletion exists (by design), and missing-file records have no
+  UI removal action yet.
+- Failed clean-ups are retried every 30 seconds while the app runs; there is no
+  separate retry schedule or backoff.
 - The countdown has 30-second resolution.
-- English-only UI.
-- TempBox runs without a Dock icon (accessory activation policy).
+- Clean-up and file moves run on the GUI thread; fine for typical temporary files.
+- Search matches file names only (no content search) and sorting is UI-only.
+- The window position under the menu bar icon depends on macOS reporting the status
+  item geometry; the first show is deferred by ~0.2 seconds to get a correct
+  position.
+- Clicking outside hides the window, but app-owned dialogs and menus keep it open.
+- Launch at login is implemented for the script-based development setup and has not
+  been verified across an actual logout/login in automated tests. It is expected to
+  be replaced by the bundled `.app` login item in Phase 4.
 - On macOS 27 the Qt tray reports clicks as `Unknown`, so the right-click tray menu
-  may not be available; quit from the window or with `Cmd+Q`.
-- On this machine `Send2Trash` uses its ctypes backend (PyObjC is not installed);
-  it was verified to move files to the macOS Trash with their original names.
+  may not be available; use the window or `Cmd+Q` to quit.
+- On this machine `Send2Trash` uses its ctypes backend (PyObjC is not installed); it
+  was verified to move files to the macOS Trash with their original names.
