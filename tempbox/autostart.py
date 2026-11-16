@@ -1,8 +1,8 @@
 """Launch-at-login support using a per-user LaunchAgent.
 
-TempBox is not bundled as a .app yet, so the agent starts the current Python
-interpreter and main.py directly. Moving the project or the Conda environment
-means toggling this setting off and on again.
+A source checkout runs the current Python interpreter and main.py. The packaged
+app runs the app binary directly, so login launch does not depend on Conda or the
+project directory.
 """
 
 from __future__ import annotations
@@ -37,14 +37,17 @@ def _write_plist() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     log_path = Path.home() / "Library" / "Logs" / "TempBox.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    executable = Path(sys.executable).resolve()
+    if getattr(sys, "frozen", False):
+        arguments = [str(executable), "--hidden"]
+        working_directory = str(executable.parent)
+    else:
+        arguments = [str(executable), str(_PROJECT_ROOT / "main.py"), "--hidden"]
+        working_directory = str(_PROJECT_ROOT)
     payload = {
         "Label": LABEL,
-        "ProgramArguments": [
-            str(Path(sys.executable).resolve()),
-            str(_PROJECT_ROOT / "main.py"),
-            "--hidden",
-        ],
-        "WorkingDirectory": str(_PROJECT_ROOT),
+        "ProgramArguments": arguments,
+        "WorkingDirectory": working_directory,
         "RunAtLoad": True,
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),

@@ -1,8 +1,17 @@
 # 变更记录
 
-TempBox 仍处于预发布阶段。下面的版本标题对应开发阶段；目前没有 GitHub Release 或可安装的 `.app`。
+v1.0.0 的发布产物已准备好，但目前尚未创建 GitHub Release。下面的版本标题对应开发阶段。
 
 [English](CHANGELOG.md) | 简体中文
+
+## v1.0.0 — Phase 5（发布候选）
+
+- 添加官方 Apache License 2.0、NOTICE 及第三方许可证/归属材料，包括 LGPL/GPL 文本和 Qt/PySide6 源码链接。
+- 添加 PyInstaller one-directory 打包、应用图标、`TempBox.app`、未签名的 Apple Silicon DMG 及构建脚本/spec。
+- 接通用户主动触发的 GitHub Releases 更新检查，支持后台 UI、版本比较，以及明确的“暂无 Release/网络/API”状态。
+- 打包应用中的 Finder Quick Action helper 与登录启动改用应用路径。
+- 添加未签名应用安装与 Gatekeeper 指引；本版本不含 Developer ID 签名或 Apple 公证。
+- 更新文档、截图、发布元数据和版本号至 1.0.0。
 
 ## v0.5.0 — Phase 4.5（未发布）
 

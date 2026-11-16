@@ -774,17 +774,12 @@ class MainWindowTest(unittest.TestCase):
             dialog = SettingsDialog(self.window)
         self.addCleanup(dialog.deleteLater)
 
-        self.assertEqual(dialog.version_label.text(), "TempBox v0.5.0")
+        self.assertEqual(dialog.version_label.text(), "TempBox v1.0.0")
         self.assertFalse(dialog.pause_checkbox.isChecked())
         self.assertTrue(dialog.reminder_checkbox.isChecked())
         self.assertIn("Install", dialog.quick_action_button.text())
-
-        with mock.patch("tempbox.dialogs.QMessageBox.information") as information:
-            dialog._on_check_updates()
-        information.assert_called_once()
-        message = information.call_args.args[2]
-        self.assertIn("not enabled", message)
-        self.assertNotIn("up to date", message.lower())
+        self.assertTrue(dialog.check_updates_button.isEnabled())
+        self.assertEqual(dialog.check_updates_button.text(), "Check for Updates\u2026")
 
     def test_settings_reminder_toggle_persists(self) -> None:
         with mock.patch(

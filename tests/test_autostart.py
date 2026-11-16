@@ -33,6 +33,20 @@ class AutoStartTest(unittest.TestCase):
         self.assertTrue(any(argument.endswith("main.py") for argument in arguments))
         self.assertIn("--hidden", arguments)
 
+    def test_frozen_app_uses_bundle_binary_without_main_py(self) -> None:
+        app_binary = "/Applications/TempBox.app/Contents/MacOS/TempBox"
+        with mock.patch.object(autostart.sys, "frozen", True, create=True), mock.patch.object(
+            autostart.sys, "executable", app_binary
+        ):
+            autostart.set_enabled(True)
+
+        payload = plistlib.loads(autostart._plist_path().read_bytes())
+        self.assertEqual(payload["ProgramArguments"], [app_binary, "--hidden"])
+        self.assertNotIn("main.py", " ".join(payload["ProgramArguments"]))
+        self.assertEqual(
+            payload["WorkingDirectory"], "/Applications/TempBox.app/Contents/MacOS"
+        )
+
     def test_disable_removes_launch_agent(self) -> None:
         autostart.set_enabled(True)
 

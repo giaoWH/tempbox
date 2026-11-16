@@ -2,13 +2,30 @@
 
 **临时文件，值得一个临时的家。**
 
-TempBox 是一款轻量的 macOS 菜单栏工具，专门收纳那些不该长期堆在桌面上的临时文件。把文件拖进悬浮面板，设置保留期限，TempBox 会把它放进自己的存储目录；到期后自动移入 macOS 废纸篓。文件随时可以打开、在 Finder 中定位、取回，或重新设置到期时间。
-
-项目当前处于 **Phase 4.5（v0.5.0）**。目前通过 Python/Conda 环境运行；正式签名的 `.app` 和公开发布计划在 Phase 5 完成。
-
 [English](README.md) | 简体中文
 
+TempBox 是一款轻量的 macOS 菜单栏工具，专门收纳那些不该长期堆在桌面上的临时文件。把文件拖进悬浮面板，设置保留期限，TempBox 会把它放进自己的存储目录；到期后自动移入 macOS 废纸篓。文件随时可以打开、在 Finder 中定位、取回，或重新设置到期时间。
+
+## 下载
+
+**TempBox 1.0.0 · Apple Silicon (arm64)**
+
+- [下载 TempBox v1.0.0](https://github.com/giaoWH/tempbox/releases/tag/v1.0.0)
+- 文件：`TempBox-1.0.0-macOS-arm64.dmg`
+- SHA-256：`4eaa943d6b67d4017aaf156a92959a3324c7abc99a07e7dc12d5ec3ac11534db`
+
+> **重要：** 此构建**没有经过 Apple 公证，也没有 Developer ID 签名**。首次启动可能被 macOS Gatekeeper 阻止。请只从官方 GitHub 仓库下载，并核对 Release 中提供的 SHA-256 校验值。安装步骤见下方。
+
 ![TempBox 深色面板](docs/screenshots/01-dark-three-files.png)
+
+## 安装未公证的 macOS 应用
+
+1. 从官方 GitHub Release 下载 `TempBox-1.0.0-macOS-arm64.dmg`。
+2. 打开 DMG，将 **TempBox.app** 拖入 **Applications**。
+3. 首次打开。如果 macOS 提示无法验证应用，**不要**关闭 Gatekeeper 或 SIP。请打开 **系统设置 → 隐私与安全性**，在安全提示中找到 TempBox 并选择 **仍要打开**；也可以在 Finder 中按住 Control 点击 TempBox，选择 **打开**。Apple 官方说明：<https://support.apple.com/guide/mac-help/mh40616/mac>。
+4. TempBox 没有 Dock 图标；请在菜单栏中寻找 TempBox 图标。
+
+TempBox v1.0.0 需要 **Apple Silicon (arm64)**。本版本不提供 Intel 构建、Developer ID 签名或 Apple 公证。
 
 ## 为什么是 TempBox
 
@@ -22,7 +39,7 @@ TempBox 是一款轻量的 macOS 菜单栏工具，专门收纳那些不该长�
 
 - 点击菜单栏图标打开紧凑悬浮面板。
 - 从 Finder 拖入单个或多个文件。
-- 默认保留期限（初始为 1 天），支持单个文件的预设期限和自定义时间。
+- 默认保留期限（初始为 1 天），支持单个文件的预设和自定义时间。
 - 到期自动移入 macOS 废纸篓；启动时补做过期检查。
 - 暂停/恢复自动清理；暂停状态持久化，恢复时若有积压文件会先询问。
 - 按添加时间、名称、大小、到期时间搜索和排序。
@@ -33,23 +50,28 @@ TempBox 是一款轻量的 macOS 菜单栏工具，专门收纳那些不该长�
 - Finder 快速操作 **Move to TempBox**（在设置中安装）。
 - 通过 LaunchAgent 登录启动。
 - 跟随系统浅色/深色外观。
-- 设置中提供当前版本和检查更新入口；本开发版本尚未启用联网更新检查。
+- 用户主动触发的 **检查更新**（GitHub Releases）；没有后台检查，也不会自动下载或静默安装。
 
-更多说明：[使用指南](docs/USAGE.zh-CN.md) · [开发指南](docs/DEVELOPMENT.zh-CN.md) · [变更记录](CHANGELOG.zh-CN.md) · [贡献指南](CONTRIBUTING.zh-CN.md)。
+更多说明：[使用指南](docs/USAGE.zh-CN.md) · [开发指南](docs/DEVELOPMENT.zh-CN.md) · [发布说明](docs/RELEASE_NOTES_v1.0.0.zh-CN.md) · [变更记录](CHANGELOG.zh-CN.md) · [贡献指南](CONTRIBUTING.zh-CN.md)。
 
 ## 环境要求
 
-- macOS（开发和测试环境：macOS 27.0.1，Apple Silicon）
+**安装版应用**
+
+- macOS，Apple Silicon（开发和测试环境：macOS 27.0.1，arm64）
+- 无需安装 Python、Conda 或 PySide6。
+
+**从源码运行/构建**
+
 - Conda / Miniconda
 - Python 3.14（验证版本 3.14.10）
 - PySide6 6.12.0、Send2Trash 2.2.0
+- PyInstaller 6.22.3（仅构建应用时需要）
 
-TempBox 目前是开发版本，**没有公开发布的 `.app` 安装包**。
-
-## 从源码运行
+## 从源码运行或构建
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/giaoWH/tempbox.git
 cd tempbox
 conda env create -f environment.yml
 conda activate tempbox
@@ -58,11 +80,21 @@ python main.py
 
 如果 `conda env create` 因 Anaconda `defaults` 频道条款未接受而报 `CondaToSNonInteractiveError`，请使用 [开发指南](docs/DEVELOPMENT.zh-CN.md) 中不经过 `defaults` 频道的显式安装命令。
 
-`python main.py --hidden` 会以“仅菜单栏”方式启动（登录启动使用这个命令）。测试和项目结构见 [开发指南](docs/DEVELOPMENT.zh-CN.md)。
+构建 `.app` 和 `.dmg`：
+
+```bash
+conda activate tempbox
+python -m pip install -r requirements-build.txt
+PYTHON="$CONDA_PREFIX/bin/python" ./scripts/build_macos.sh
+```
+
+输出：`dist/TempBox.app` 和 `dist/TempBox-1.0.0-macOS-arm64.dmg`。
+
+`python main.py --hidden` 仅启动菜单栏图标（登录启动使用）。完整构建和测试说明见 [开发指南](docs/DEVELOPMENT.zh-CN.md)。
 
 ## 快速使用
 
-点击菜单栏图标打开面板，把文件拖入即可，文件使用当前默认期限。文件行右侧的 `···` 菜单可以打开、定位、取回或修改期限；点击 **Select** 进入多选批量操作；齿轮按钮打开设置。
+点击菜单栏图标打开面板，把文件拖入即可，文件使用当前默认期限。文件行右侧的 `···` 菜单可以打开、定位、取回或修改期限；点击 **Select** 进入多选批量操作；齿轮按钮打开设置，包括默认期限、暂停、提醒、Finder 快速操作、关于和检查更新。
 
 到期文件会移入 macOS 废纸篓，不会被永久删除。TempBox 未运行时，过期清理会在下次启动时进行；暂停状态在重启后仍然有效。完整说明见 [使用指南](docs/USAGE.zh-CN.md)。
 
@@ -76,9 +108,11 @@ python main.py
 - 同时检查右键菜单中的 **Quick Actions** 和 **Services**；
 - 在系统设置 → 键盘 → 键盘快捷键 → 服务中启用 **Move to TempBox**（部分 macOS 版本位于“通用 → 登录项与扩展”）。
 
-### 菜单栏图标拖拽
+移动 `.app` 后需要重新安装 Quick Action。
 
-当前 PySide6 `QSystemTrayIcon` 不支持把文件直接拖到菜单栏图标上。请使用悬浮面板拖入。这是为了不引入不稳定的原生状态栏桥接而做的有意取舍。
+### 检查更新
+
+设置 → **About TempBox → Check for Updates…** 只在你主动点击时查询 GitHub Releases API。它会显示已是最新版本、发现新版本、暂无正式 Release、限流或网络错误/API 错误；不会自动下载、替换或静默安装。
 
 ## 文件安全
 
@@ -97,7 +131,7 @@ TempBox 管理的文件位于：
 - 文件缺失只报告，不当作清理成功；
 - App 与 Finder 快速操作通过文件锁串行写入索引，避免互相覆盖。
 
-缺失或未知的元数据绝不会被用于删除任意文件。清理历史和提醒本身不删除文件。数据格式详见 [开发指南](docs/DEVELOPMENT.zh-CN.md)。
+缺失或未知的元数据绝不会被用于删除任意文件。清理历史、提醒和更新检查本身不删除文件。数据格式详见 [开发指南](docs/DEVELOPMENT.zh-CN.md)。
 
 ## 截图
 
@@ -117,13 +151,18 @@ TempBox 管理的文件位于：
 | 3.5 | 悬浮面板 UI 集成 | v0.3.5 |
 | 4 | Finder 快速操作、历史、暂停、提醒 | v0.4 |
 | 4.5 | 代码重构、项目清理、文档 | v0.5 |
+| 5 | Apache-2.0、打包、DMG、更新检查 | v1.0.0 |
 
-**仓库中尚不包含：** 打包好的 `.app`/`.dmg`、代码签名与公证、GitHub Release、正式联网更新检查、最终应用图标。这些属于 Phase 5。
-
-### 后续路线
-
-- **Phase 5：** 应用图标、`.app`/`.dmg` 打包、签名与公证、GitHub Releases、联网更新检查，以及打包环境下对 Finder 快速操作注册和通知投递的验证。暂不承诺具体日期。
+Developer ID 签名、公证、Intel 构建和正式签名安装体验属于后续工作，不是本版本的声明。详见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)。
 
 ## 许可证
 
-本项目尚未选择许可证。对于这样的小型工具，建议考虑 **MIT** 或 **Apache-2.0**；最终由仓库所有者决定。在确定之前，请不要默认代码已经以某种开源许可证授权。详见 [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)。
+TempBox 自有代码采用 **Apache License 2.0**。见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。第三方组件分别适用其自身许可证，主要包括 PySide6/Qt（选择 LGPL-3.0）、Python（PSF）、Send2Trash（BSD-3-Clause）以及 PyInstaller bootloader（GPL-2.0 加 PyInstaller Bootloader Exception）。详见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) 和 [`licenses/`](licenses/) 目录。
+
+Apache-2.0 **不能**覆盖或替代第三方许可证。
+
+## 反馈与贡献
+
+- Issues：<https://github.com/giaoWH/tempbox/issues>
+- 贡献指南：[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)
+- v1.0.0 未经过 Apple 公证；如发现安全或数据丢失问题，请提供复现步骤和受影响的文件流程，但**不要附带真实个人文件**。

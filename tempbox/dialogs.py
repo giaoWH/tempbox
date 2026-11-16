@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QDateTime, QSize, Qt
+from PySide6.QtCore import QDateTime, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -77,9 +79,14 @@ class ExpiryDialog(QDialog):
 class SettingsDialog(QDialog):
     """Default retention, auto-cleanup controls, Finder integration and About."""
 
+    update_check_finished = Signal(object)
+
     def __init__(self, window: "MainWindow") -> None:
         super().__init__(window)
         self.window = window
+        self._update_thread: threading.Thread | None = None
+        self._closed = False
+        self.update_check_finished.connect(self._show_update_status)
         self.setWindowTitle("TempBox Settings")
         self.setMinimumWidth(440)
 
@@ -217,12 +224,60 @@ class SettingsDialog(QDialog):
         )
 
     def _on_check_updates(self) -> None:
-        status = updates.check_for_updates()
-        QMessageBox.information(
-            self,
-            "Check for Updates",
-            f"{status.message}\n\nCurrent version: {updates.current_version()}",
+        if self._update_thread is not None and self._update_thread.is_alive():
+            return
+        self.check_updates_button.setEnabled(False)
+        self.check_updates_button.setText("Checking\u2026")
+        self._update_thread = threading.Thread(
+            target=self._run_update_check,
+            name="tempbox-update-check",
+            daemon=True,
         )
+        self._update_thread.start()
+
+    def _run_update_check(self) -> None:
+        status = updates.check_for_updates()
+        self.update_check_finished.emit(status)
+
+    def _show_update_status(self, status: updates.UpdateStatus) -> None:
+        if self._closed:
+            return
+        self.check_updates_button.setEnabled(True)
+        self.check_updates_button.setText("Check for Updates\u2026")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Check for Updates")
+        if status.state == "update_available":
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(status.message)
+            if status.release_notes:
+                box.setInformativeText(status.release_notes)
+        elif status.state == "up_to_date":
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(status.message)
+        elif status.state == "no_release":
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(status.message)
+            box.setInformativeText(
+                "The Releases page will show the first public release when it is published."
+            )
+        else:
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(status.message)
+
+        open_button = None
+        if status.release_url:
+            open_button = box.addButton(
+                "Open GitHub Release", QMessageBox.ButtonRole.ActionRole
+            )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if open_button is not None and box.clickedButton() is open_button:
+            QDesktopServices.openUrl(QUrl(status.release_url))
+
+    def done(self, result: int) -> None:
+        self._closed = True
+        super().done(result)
 
     def _on_autostart_toggled(self, enabled: bool) -> None:
         try:

@@ -47,6 +47,9 @@ license is chosen; until then, please open an issue before sending substantial c
 
 ## License
 
-No license has been selected yet. Contributions cannot be distributed under a public
-license until the repository owner chooses one (MIT and Apache-2.0 are reasonable
-candidates for a project of this size). Do not assume a license.
+TempBox's own source code is licensed under the **Apache License 2.0**. By submitting
+a contribution, you agree that it may be distributed under the same license. There is
+no separate CLA. Third-party components remain under their own licenses; see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+Do not commit build outputs, DMGs, local environments or user data.

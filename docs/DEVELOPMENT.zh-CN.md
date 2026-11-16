@@ -11,8 +11,9 @@
 - Python 3.14（验证版本 3.14.10）
 - PySide6 6.12.0
 - Send2Trash 2.2.0
+- PyInstaller 6.22.3（仅构建应用）
 
-测试使用 Python 标准库 `unittest`，不需要额外测试框架或第三方测试依赖。
+测试使用 Python 标准库 `unittest`，不需要额外测试框架。
 
 ## 创建环境
 
@@ -41,7 +42,39 @@ conda activate tempbox
 python main.py
 ```
 
-`python main.py --hidden` 会只显示菜单栏图标，不打开面板（登录启动使用）。当前运行的是开发脚本而不是打包应用，因此登录启动和 Finder 快速操作会嵌入当前 Python/项目路径。
+`python main.py --hidden` 会只显示菜单栏图标，不打开面板（登录启动使用）。开发运行时，登录启动和 Finder 快速操作使用当前 Python/项目路径；打包应用改用应用二进制。
+
+## 构建 macOS 应用和 DMG
+
+v1.0.0 的发布构建面向 Apple Silicon (arm64)，使用 PyInstaller one-directory 应用，且有意不做 Developer ID 签名和 Apple 公证。
+
+```bash
+conda activate tempbox
+python -m pip install -r requirements-build.txt
+PYTHON="$CONDA_PREFIX/bin/python" ./scripts/build_macos.sh
+```
+
+脚本使用 [TempBox.spec](../TempBox.spec)，生成：
+
+- `dist/TempBox.app`
+- `dist/TempBox-1.0.0-macOS-arm64.dmg`
+- `dist/TempBox-1.0.0-macOS-arm64.dmg.sha256`
+
+`TempBox.spec` 配置了 bundle identifier（`com.tempbox.app`）、版本（从 `tempbox/__init__.py` 读取）、`LSUIElement`、图标和许可证资源。PyInstaller 只会做 ad-hoc 签名；不要把它描述为 Developer ID 签名或已公证。
+
+Phase 5 使用的独立打包验证：
+
+```bash
+# 不依赖 Conda 环境启动菜单栏应用
+env -i HOME=/tmp/tempbox-test TMPDIR=/tmp PATH=/usr/bin:/bin \
+  dist/TempBox.app/Contents/MacOS/TempBox --hidden
+
+# 包内 Quick Action 的无头导入入口
+env -i HOME=/tmp/tempbox-test TMPDIR=/tmp PATH=/usr/bin:/bin \
+  dist/TempBox.app/Contents/MacOS/TempBox --quick-action /tmp/a-file
+```
+
+用 `hdiutil attach -nobrowse -readonly ...` 挂载 DMG，确认包含 `TempBox.app`、`Applications` 快捷方式和许可证文件。更换依赖或 Qt/PyInstaller 版本后必须重新构建和验证。
 
 ## 测试
 
@@ -72,6 +105,14 @@ python -m unittest discover -s tests -t . -v
 ├── CONTRIBUTING.zh-CN.md
 ├── CHANGELOG.md
 ├── CHANGELOG.zh-CN.md
+├── LICENSE                  # TempBox 源代码 Apache-2.0
+├── NOTICE
+├── THIRD_PARTY_LICENSES.md  # 第三方归属与 LGPL 说明
+├── TempBox.spec             # PyInstaller 构建定义
+├── requirements-build.txt   # 仅构建用 PyInstaller 版本
+├── assets/TempBox.icns      # 应用图标
+├── licenses/                # 随发行物提供的第三方许可证文本
+├── scripts/build_macos.sh   # .app + .dmg 构建入口
 ├── docs/
 │   ├── USAGE.md             # 英文用户指南
 │   ├── USAGE.zh-CN.md       # 中文用户指南
@@ -92,7 +133,7 @@ python -m unittest discover -s tests -t . -v
 │   ├── autostart.py         # 用户级 LaunchAgent
 │   ├── macos.py             # 少量 AppKit/ctypes 桥接（Dock/焦点）
 │   ├── quick_action.py      # Finder Quick Action 安装器和导入 helper
-│   └── updates.py           # 预留的更新检查接口
+│   └── updates.py           # GitHub Releases 更新检查
 └── tests/                   # unittest 回归测试
 ```
 
@@ -100,7 +141,7 @@ python -m unittest discover -s tests -t . -v
 
 - **UI**：`window.py`、`ui_theme.py`、`ui_widgets.py`、`dialogs.py` 只负责展示和收集用户意图，不直接移动文件。
 - **核心/存储**：`storage.py` 拥有所有文件移动和索引修改；`history.py`、`settings.py` 负责各自的持久化数据。
-- **系统服务**：`app.py`（菜单栏/托盘生命周期）、`quick_action.py`（Finder）、`autostart.py`（登录启动）、`macos.py`（少量原生桥接）、`updates.py`（未来更新检查）。
+- **系统服务**：`app.py`（菜单栏/托盘生命周期）、`quick_action.py`（Finder）、`autostart.py`（登录启动）、`macos.py`（少量原生桥接）、`updates.py`（GitHub Releases 更新检查）。
 
 不要为一个简单辅助函数新建模块；只有职责明确且独立时才拆分。不要为了这个规模的应用引入框架、依赖注入或复杂抽象。
 
@@ -153,15 +194,29 @@ App 和 Finder Quick Action helper 都可能导入文件。`FileStore` 用 `.dat
 
 ## Finder 快速操作
 
-`quick_action.py` 会在 `~/Library/Services` 安装 Automator `.workflow`，并调用 `/System/Library/CoreServices/pbs -update` 让 macOS 重新读取服务列表。workflow 中的 Run Shell Script 执行：
+`quick_action.py` 会在 `~/Library/Services` 安装 Automator `.workflow`，并调用 `/System/Library/CoreServices/pbs -update` 让 macOS 重新读取服务列表。workflow 中的 Run Shell Script 在源码模式下执行：
 
 ```bash
 cd "<project>" && "<python>" -m tempbox.quick_action "$@"
 ```
 
-helper 会读取 `settings.json`、创建普通 `FileStore`、应用默认期限并导入选中文件，完全复用应用的安全与锁路径。App 若正在运行，会通过 2 秒一次的索引检查发现变化，不需要额外 IPC 协议。
+打包应用中改为直接执行应用二进制：
 
-workflow 由 `quick_action.py` 中的 plist 字典生成，已用 `/usr/bin/automator` 在临时 home 目录做过端到端验证。Finder 服务注册/缓存仍需要人工验证；排查步骤见使用指南。Phase 5 打包后需要让 workflow 指向稳定的打包应用路径，而不是当前开发 Python/项目路径。
+```bash
+"/Applications/TempBox.app/Contents/MacOS/TempBox" --quick-action "$@"
+```
+
+`main.py` 会在创建 `QApplication` 之前处理 `--quick-action`，因此这是一个无头导入进程。helper 会读取 `settings.json`、创建普通 `FileStore`、应用默认期限并导入选中文件，完全复用应用的安全与锁路径。App 若正在运行，会通过 2 秒一次的索引检查发现变化，不需要额外 IPC 协议。
+
+workflow 由 `quick_action.py` 中的 plist 字典生成，已用 `/usr/bin/automator` 在临时 home 目录做过端到端验证，包内 `--quick-action` 入口也做了独立测试。Finder 服务注册/缓存仍需要人工验证；排查步骤见使用指南。移动 `.app` 后需要重新安装 Quick Action。
+
+## 更新检查
+
+`updates.py` 使用已确认的仓库（`https://github.com/giaoWH/tempbox`）和 GitHub `/releases/latest` API。设置 UI 在后台线程发起网络请求，通过 Qt 信号回到 GUI 线程，不会阻塞界面。状态包括 `up_to_date`、`update_available`、`no_release`、`network_error` 和 `api_error`。没有后台检查、自动下载、替换或重启。
+
+## 登录启动和打包路径
+
+`autostart.py` 在源码模式下写入当前解释器和 `main.py`；打包后写入应用二进制和 `--hidden`。LaunchAgent 使用与应用 bundle 相同的 `com.tempbox.app` 标识。移动应用或源码项目后需要重新开关登录启动。
 
 ## 通知、暂停与提醒
 
@@ -180,6 +235,10 @@ workflow 由 `quick_action.py` 中的 plist 字典生成，已用 `/usr/bin/auto
 - 修改后运行 `compileall` 和测试。
 - 不要提交个人数据、日志、本地环境或构建产物。
 
+## 许可证
+
+TempBox 源代码采用 Apache-2.0；见 [LICENSE](../LICENSE) 和 [NOTICE](../NOTICE)。第三方组件分别适用其自身许可证；PySide6/Qt 选择 LGPL-3.0，随应用/DMG 提供许可证文本和源码链接，详见 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) 与 `licenses/`。修改构建时必须继续包含这些文件。
+
 ## 参与贡献
 
-见 [贡献指南](../CONTRIBUTING.zh-CN.md)。在公开发布前，仓库所有者需要确定许可证；当前尚未应用任何许可证。
+见 [贡献指南](../CONTRIBUTING.zh-CN.md)。

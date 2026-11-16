@@ -192,6 +192,9 @@ def _workflow_document(command: str) -> dict:
 
 
 def shell_command(project_root: Path | str | None = None, python: str | None = None) -> str:
+    if getattr(sys, "frozen", False):
+        executable = str(Path(sys.executable).resolve())
+        return f"{shlex.quote(executable)} --quick-action \"$@\""
     project = Path(project_root or Path(__file__).resolve().parent.parent)
     executable = python or sys.executable
     return (

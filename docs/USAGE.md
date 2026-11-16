@@ -5,8 +5,23 @@ English | [简体中文](USAGE.zh-CN.md)
 TempBox keeps temporary files out of the way and moves them to the macOS Trash when
 their time is up. It runs as a menu bar app with a compact floating panel.
 
-> This guide describes the current v0.5.0 development build. TempBox currently runs
-> from a Conda environment; a packaged `.app` is planned for a later phase.
+> This guide describes the installed **v1.0.0** build (Apple Silicon). The app is
+> distributed as an unsigned, non-notarized DMG; Gatekeeper may block first launch.
+> See the installation section below. Source runs remain available for development.
+
+## Install the macOS app
+
+1. Download `TempBox-1.0.0-macOS-arm64.dmg` from the official GitHub Release.
+2. Open the DMG and drag **TempBox.app** to **Applications**.
+3. If macOS blocks the first launch, do **not** disable Gatekeeper or SIP. Open
+   **System Settings → Privacy & Security**, find TempBox and use **Open Anyway**;
+   alternatively Control-click the app in Finder and choose **Open**. See Apple's
+   official guidance: <https://support.apple.com/guide/mac-help/mh40616/mac>.
+4. TempBox has no Dock icon; use the menu bar icon.
+
+This build is not Developer ID signed or notarized. Download only from the official
+GitHub repository and verify the published SHA-256 checksum. Apple Silicon (arm64)
+is the only v1.0.0 architecture.
 
 ## Opening the panel
 
@@ -44,7 +59,8 @@ not open a file picker. If it is missing from Finder:
 - enable **Move to TempBox** under System Settings → Keyboard → Keyboard Shortcuts →
   Services (on some macOS versions: General → Login Items & Extensions).
 
-Remove it from Settings when no longer needed.
+Remove it from Settings when no longer needed. If you move or replace the `.app`,
+reinstall the Quick Action so the workflow uses the new app path.
 
 > Dragging files onto the menu bar icon itself is not supported. Use the panel.
 
@@ -127,9 +143,10 @@ in Settings.
 
 Reminders are checked while TempBox is running (at startup and on the periodic check).
 They are not sent while the app is quit. Notification delivery depends on macOS
-Notification Center permissions and the development-script launch mode; if notifications
-do not appear, cleanup still behaves normally. Reminder state is kept in memory for the
-current run; a restart may produce one reminder again for the same cycle.
+Notification Center permissions and the way the unsigned app is launched; if
+notifications do not appear, cleanup still behaves normally. Reminder state is kept
+in memory for the current run; a restart may produce one reminder again for the same
+cycle.
 
 ## Settings
 
@@ -137,19 +154,25 @@ The gear opens settings for:
 
 - **Default retention for new files** — applies to future imports only.
 - **Launch TempBox at login** — writes a per-user LaunchAgent that starts the app
-  hidden. If you move the Python environment or project, toggle this off/on again.
+  hidden. If you move the `.app` (or the Python environment when running from
+  source), toggle this off and on again.
 - **Pause automatic cleanup** — see above.
 - **Remind me 10 minutes before expiry** — reminder toggle.
 - **Finder Quick Action** — install/remove.
-- **About TempBox** — current version and **Check for Updates…**. Update checking is
-  not enabled in this development version; the dialog says so explicitly and performs
-  no network request.
+- **About TempBox** — current version and **Check for Updates…**. The check runs only
+  when you click it, in the background, and queries the official GitHub Releases API.
 
 ## Update checks
 
-The current build exposes only the update-check interface. No background network
-requests are made, and the app never claims it is up to date. GitHub Releases support
-is planned for Phase 5.
+**Check for Updates…** is user-triggered. It can report:
+
+- up to date;
+- a newer stable release, with its version, short release notes and a link to the
+  GitHub Release;
+- no public release yet (this is not reported as up to date);
+- a network failure, GitHub rate limit or unexpected API response.
+
+There are no background checks, automatic downloads, silent installs or restarts.
 
 ## Where files live
 

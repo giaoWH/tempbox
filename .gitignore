@@ -31,4 +31,4 @@ env/
 # Packaging artifacts
 build/
 dist/
-*.spec
+*.dmg

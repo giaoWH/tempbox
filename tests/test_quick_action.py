@@ -162,6 +162,16 @@ class QuickActionTest(unittest.TestCase):
         self.assertIn('-m tempbox.quick_action "$@"', command)
 
 
+    def test_frozen_app_quick_action_uses_bundle_binary(self) -> None:
+        app_binary = "/Applications/TempBox.app/Contents/MacOS/TempBox"
+        with mock.patch.object(
+            quick_action.sys, "frozen", True, create=True
+        ), mock.patch.object(quick_action.sys, "executable", app_binary):
+            command = quick_action.shell_command()
+
+        self.assertEqual(command, f"{app_binary} --quick-action \"$@\"")
+
+
 class RefreshServicesTest(unittest.TestCase):
     def test_refresh_services_failure_is_non_fatal(self) -> None:
         with mock.patch(

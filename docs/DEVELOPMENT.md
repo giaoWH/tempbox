@@ -12,9 +12,9 @@ see [USAGE.md](USAGE.md).
 - Python 3.14 (verified 3.14.10)
 - PySide6 6.12.0
 - Send2Trash 2.2.0
+- PyInstaller 6.22.3 (build only)
 
-No test framework or other third-party package is required; the suite uses the
-standard library `unittest`.
+No test framework is required; the suite uses the standard library `unittest`.
 
 ## Environment setup
 
@@ -45,8 +45,46 @@ python main.py
 ```
 
 `python main.py --hidden` starts from the menu bar without showing the panel (used by
-the login LaunchAgent). The result is a development script, not a packaged app; login
-launch and Finder integration therefore embed the current Python/project paths.
+the login LaunchAgent). Development runs use the current Python/project paths for
+login launch and Finder integration; the packaged app uses the app binary instead.
+
+## Build the macOS app and DMG
+
+The release build targets Apple Silicon (arm64), is a PyInstaller one-directory app,
+and is intentionally not Developer ID signed or notarized for v1.0.0.
+
+```bash
+conda activate tempbox
+python -m pip install -r requirements-build.txt
+PYTHON="$CONDA_PREFIX/bin/python" ./scripts/build_macos.sh
+```
+
+The script uses [TempBox.spec](../TempBox.spec), generates:
+
+- `dist/TempBox.app`
+- `dist/TempBox-1.0.0-macOS-arm64.dmg`
+- `dist/TempBox-1.0.0-macOS-arm64.dmg.sha256`
+
+`TempBox.spec` sets the bundle identifier (`com.tempbox.app`), version (read from
+`tempbox/__init__.py`), `LSUIElement`, icon and the license/notice resources. The
+build is ad-hoc signed by the PyInstaller bundling tools only; do not describe it as
+Developer ID signed or notarized.
+
+Independent packaged-app checks used during Phase 5:
+
+```bash
+# Menu-bar-only launch without Conda in the environment
+env -i HOME=/tmp/tempbox-test TMPDIR=/tmp PATH=/usr/bin:/bin \
+  dist/TempBox.app/Contents/MacOS/TempBox --hidden
+
+# Headless Quick Action import path inside the bundle
+env -i HOME=/tmp/tempbox-test TMPDIR=/tmp PATH=/usr/bin:/bin \
+  dist/TempBox.app/Contents/MacOS/TempBox --quick-action /tmp/a-file
+```
+
+Mount the DMG with `hdiutil attach -nobrowse -readonly ...` and verify it contains
+`TempBox.app`, an `Applications` symlink and the license files. Rebuild and recheck
+after changing dependencies or the Qt/PyInstaller versions.
 
 ## Tests
 
@@ -76,11 +114,23 @@ installation and troubleshooting steps.
 ├── main.py                  # entry point: python main.py
 ├── environment.yml          # Conda runtime environment
 ├── README.md                # project overview
+├── README.zh-CN.md
 ├── CONTRIBUTING.md
 ├── CHANGELOG.md
+├── LICENSE                  # Apache-2.0 for TempBox source
+├── NOTICE
+├── THIRD_PARTY_LICENSES.md  # third-party attribution and LGPL notes
+├── TempBox.spec             # PyInstaller build definition
+├── requirements-build.txt   # build-only PyInstaller pin
+├── assets/TempBox.icns      # application icon
+├── licenses/                # bundled third-party license texts
+├── scripts/build_macos.sh   # .app + .dmg build entry point
 ├── docs/
 │   ├── USAGE.md
+│   ├── USAGE.zh-CN.md
 │   ├── DEVELOPMENT.md
+│   ├── DEVELOPMENT.zh-CN.md
+│   ├── RELEASE_NOTES_v1.0.0.md
 │   └── screenshots/         # screenshots of the real app
 ├── tempbox/
 │   ├── app.py               # QApplication, tray icon, menu bar behavior, quit flow
@@ -96,7 +146,7 @@ installation and troubleshooting steps.
 │   ├── autostart.py         # per-user LaunchAgent
 │   ├── macos.py             # small AppKit/ctypes bridge (Dock/focus)
 │   ├── quick_action.py      # Finder Quick Action installer + import helper
-│   └── updates.py           # reserved update-check interface
+│   └── updates.py           # GitHub Releases update checker
 └── tests/                   # unittest suite
 ```
 
@@ -107,8 +157,8 @@ Responsibilities follow the app's real boundaries rather than a framework:
 - **Core/storage**: `storage.py` owns all file movement and index mutation; `history.py`
   and `settings.py` own their respective persisted data.
 - **Services**: `app.py` (menu bar/tray lifecycle), `quick_action.py` (Finder),
-  `autostart.py` (login), `macos.py` (small native bridge), `updates.py` (future
-  update checks).
+  `autostart.py` (login), `macos.py` (small native bridge), `updates.py` (GitHub
+  Releases update checks).
 
 Avoid adding a new module for a one-line helper; add one only when it has a clear,
 independent responsibility. Do not introduce a framework or dependency injection layer
@@ -177,22 +227,44 @@ Changes to these paths need regression tests in `tests/test_storage.py` and
 
 `quick_action.py` installs an Automator `.workflow` into `~/Library/Services` and calls
 `/System/Library/CoreServices/pbs -update` so macOS re-reads the service list. The
-workflow's Run Shell Script action executes:
+workflow's Run Shell Script action executes, in a source checkout:
 
 ```bash
 cd "<project>" && "<python>" -m tempbox.quick_action "$@"
 ```
 
-The helper loads `settings.json`, creates a normal `FileStore`, applies the default
-retention and imports the selected files. This deliberately reuses the same safety
-and locking path as the app. If TempBox is already running, its 2-second index poll
-shows the changes without an IPC protocol.
+In the packaged app it executes the app binary directly:
+
+```bash
+"/Applications/TempBox.app/Contents/MacOS/TempBox" --quick-action "$@"
+```
+
+`main.py` handles `--quick-action` before creating `QApplication`, so this is a
+headless import process. The helper loads `settings.json`, creates a normal
+`FileStore`, applies the default retention and imports the selected files. This
+deliberately reuses the same safety and locking path as the app. If TempBox is already
+running, its 2-second index poll shows the changes without an IPC protocol.
 
 The workflow is generated from plist dictionaries in `quick_action.py`; it was
-validated end-to-end with `/usr/bin/automator` in a temporary home directory. Finder
-service registration/caching still needs manual verification; see USAGE.md for
-troubleshooting. Packaging (Phase 5) will need to embed a stable executable path rather
-than the development Python/project paths.
+validated end-to-end with `/usr/bin/automator` in a temporary home directory and the
+packaged `--quick-action` entry point was tested independently. Finder service
+registration/caching still needs manual verification; see USAGE.md for
+troubleshooting. Moving the `.app` requires reinstalling the Quick Action.
+
+## Update checks
+
+`updates.py` uses the confirmed repository (`https://github.com/giaoWH/tempbox`) and
+the GitHub `/releases/latest` API. The Settings UI runs the network request on a
+background thread and emits a queued Qt signal; it never blocks the GUI. Statuses
+distinguish `up_to_date`, `update_available`, `no_release`, `network_error` and
+`api_error`. No background checks, downloads, replacement or restart are implemented.
+
+## Login launch and packaged paths
+
+`autostart.py` writes `com.tempbox.app.plist` with the current interpreter plus
+`main.py` during development, and with the app binary plus `--hidden` when frozen.
+The LaunchAgent uses the same bundle label as the app bundle identifier. Moving the
+app or the source checkout requires toggling the setting off and on again.
 
 ## Notifications, pause and reminders
 
@@ -214,7 +286,14 @@ than the development Python/project paths.
 - Run compileall/tests after changes.
 - Do not commit personal data, logs, environment folders or build artifacts.
 
+## Licensing
+
+TempBox source is Apache-2.0; see [LICENSE](../LICENSE) and [NOTICE](../NOTICE).
+Third-party components are covered by their own licenses; PySide6/Qt use the LGPL-3.0
+option, and bundled license texts plus source references are in
+[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) and `licenses/`. Keep these files
+in the app and DMG when changing the build.
+
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md). Before a public release, the repository
-owner should select a license; no license has been applied yet.
+See [CONTRIBUTING.md](../CONTRIBUTING.md).

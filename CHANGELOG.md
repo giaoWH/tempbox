@@ -2,8 +2,21 @@
 
 English | [简体中文](CHANGELOG.zh-CN.md)
 
-TempBox is still pre-release. Version headings below describe development phases; no
-GitHub Releases or installable `.app` builds exist yet.
+v1.0.0 release artifacts are prepared, but no GitHub Release has been published yet.
+Version headings below describe development phases.
+
+## v1.0.0 — Phase 5 (release candidate)
+
+- Added the official Apache License 2.0, NOTICE and third-party license/attribution
+  material, including LGPL/GPL texts and Qt/PySide6 source references.
+- Added PyInstaller one-directory packaging, app icon, `TempBox.app`, unsigned
+  Apple Silicon DMG and build script/spec.
+- Added a user-triggered GitHub Releases update checker with background UI handling,
+  version comparison and explicit no-release/network/API states.
+- Added packaged-app path handling for the Finder Quick Action helper and login launch.
+- Added unsigned-app installation and Gatekeeper guidance; no Developer ID signing or
+  Apple notarization in this release.
+- Updated documentation, screenshots, release metadata and version to 1.0.0.
 
 ## v0.5.0 — Phase 4.5 (unreleased)
 
