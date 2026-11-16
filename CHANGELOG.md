@@ -2,10 +2,10 @@
 
 English | [简体中文](CHANGELOG.zh-CN.md)
 
-v1.0.0 release artifacts are prepared, but no GitHub Release has been published yet.
-Version headings below describe development phases.
+v1.0.0 was published as TempBox's first public macOS release. Version headings
+below describe development phases.
 
-## v1.0.0 — Phase 5 (release candidate)
+## v1.0.0 — Phase 5 (released)
 
 - Added the official Apache License 2.0, NOTICE and third-party license/attribution
   material, including LGPL/GPL texts and Qt/PySide6 source references.
