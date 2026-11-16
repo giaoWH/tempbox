@@ -1,10 +1,10 @@
 # 变更记录
 
-v1.0.0 的发布产物已准备好，但目前尚未创建 GitHub Release。下面的版本标题对应开发阶段。
+v1.0.0 已作为 TempBox 首个公开 macOS 版本发布。下面的版本标题对应开发阶段。
 
 [English](CHANGELOG.md) | 简体中文
 
-## v1.0.0 — Phase 5（发布候选）
+## v1.0.0 — Phase 5（已发布）
 
 - 添加官方 Apache License 2.0、NOTICE 及第三方许可证/归属材料，包括 LGPL/GPL 文本和 Qt/PySide6 源码链接。
 - 添加 PyInstaller one-directory 打包、应用图标、`TempBox.app`、未签名的 Apple Silicon DMG 及构建脚本/spec。
